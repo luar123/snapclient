@@ -20,6 +20,9 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "wifi_interface.h"
+#if CONFIG_PM_ENABLE
+#include "esp_pm.h"
+#endif
 
 // Minimum ESP-IDF stuff only hardware abstraction stuff
 #include "board.h"
@@ -715,6 +718,31 @@ void opus_decoder_task(void *pvParameters) {
  *
  */
 esp_err_t audio_set_mute(bool mute) {
+/**
+#if CONFIG_PM_ENABLE
+    static bool lock_taken = true;
+    esp_err_t ret = NULL;
+    if (mute) {
+        if (lock_taken) {
+            do {
+                ret = esp_pm_lock_release(s_pm_apb_lock);
+            } while(ret == ESP_OK);
+            if (ret == ESP_ERR_INVALID_STATE) {
+                ESP_LOGI(TAG, "PM enabled");
+                lock_taken = false;
+                stop_player();
+            }
+        }
+    } else {
+        if (!lock_taken) {
+            lock_taken = true;
+            ESP_ERROR_CHECK(esp_pm_lock_acquire(s_pm_apb_lock));
+            ESP_LOGI(TAG, "PM disabled");
+            restart_player();
+        }
+    }
+#endif //CONFIG_PM_ENABLE
+**/
   if (!board_handle) {
     ESP_LOGW(TAG, "audio board not initialized yet");
 
@@ -2381,8 +2409,7 @@ static void http_get_task(void *pvParameters) {
                                     (double)server_settings_message.volume / 100);
                             }
 #endif
-                          audio_hal_set_mute(board_handle->audio_hal,
-                                             server_settings_message.muted);
+                          audio_set_mute(server_settings_message.muted);
                         }
                                              
                         if (scSet.volume != server_settings_message.volume) {
@@ -2773,6 +2800,29 @@ void app_main(void) {
   // if enabled these cause a timer srv stack overflow
   esp_log_level_set("HEADPHONE", ESP_LOG_NONE);
   esp_log_level_set("gpio", ESP_LOG_NONE);
+  
+  // enable power management
+#if CONFIG_PM_ENABLE
+    static esp_pm_lock_handle_t s_pm_apb_lock   = NULL;
+    //Configure dynamic frequency scaling:
+    //automatic light sleep is enabled if tickless idle support is enabled.
+    esp_pm_config_esp32_t pm_config = {
+        .max_freq_mhz = 240, //Maximum CPU frequency
+        .min_freq_mhz = 40,  //Minimum CPU frequency
+#if CONFIG_FREERTOS_USE_TICKLESS_IDLE
+        .light_sleep_enable = true
+#endif
+    };
+    ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+
+    if (s_pm_apb_lock == NULL) {
+        if (esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "l_apb", &s_pm_apb_lock) != ESP_OK) {
+            ESP_LOGE(TAG, "esp pm lock create failed");
+        }
+    }
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(s_pm_apb_lock));
+    ESP_LOGI(TAG, "PM disabled");
+#endif //CONFIG_PM_ENABLE
 
 #if CONFIG_SNAPCLIENT_ENABLE_ETHERNET
   // clang-format off
@@ -2824,7 +2874,9 @@ void app_main(void) {
 
   i2s_mclk_gpio_select(I2S_NUM_0, CONFIG_MASTER_I2S_MCLK_PIN);
 #endif
-
+  gpio_set_direction(GPIO_NUM_2, GPIO_MODE_OUTPUT);
+  gpio_set_level(GPIO_NUM_2, 1);
+  
   ESP_LOGI(TAG, "Start codec chip");
   board_handle = audio_board_init();
   if (board_handle) {
@@ -2840,7 +2892,7 @@ void app_main(void) {
   audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_BOTH,
                        AUDIO_HAL_CTRL_START);
   audio_hal_set_mute(board_handle->audio_hal,
-                     true);  // ensure no noise is sent after firmware crash
+                       true);  // ensure no noise is sent after firmware crash
 
   ESP_LOGI(TAG, "init player");
   init_player();
@@ -2872,7 +2924,10 @@ void app_main(void) {
 #if CONFIG_USE_DSP_PROCESSOR
   dsp_processor_init();
 #endif
-
+#if CONFIG_PM_ENABLE
+    esp_pm_lock_release(s_pm_apb_lock);
+    ESP_LOGI(TAG, "PM enabled");
+#endif //CONFIG_PM_ENABLE
   xTaskCreatePinnedToCore(&ota_server_task, "ota", 14 * 256, NULL,
                           OTA_TASK_PRIORITY, t_ota_task, OTA_TASK_CORE_ID);
 

@@ -59,6 +59,8 @@ typedef struct snapcastSetting_s {
 
 int init_player(void);
 int deinit_player(void);
+int restart_player(void);
+int stop_player(void);
 
 int32_t allocate_pcm_chunk_memory(pcm_chunk_message_t **pcmChunk, size_t bytes);
 int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk);

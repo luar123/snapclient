@@ -15,6 +15,9 @@
 #include "esp_log.h"
 
 #include "esp_wifi.h"
+#if CONFIG_PM_ENABLE
+#include "esp_pm.h"
+#endif
 
 #include "soc/rtc.h"
 
@@ -80,6 +83,12 @@ static snapcastSetting_t currentSnapcastSetting;
 static void tg0_timer_init(void);
 static void tg0_timer_deinit(void);
 static void player_task(void *pvParameters);
+#if CONFIG_PM_ENABLE
+static esp_pm_lock_handle_t s_pm_apb_lock   = NULL;
+#endif //CONFIG_PM_ENABLE
+
+bool gotSettings = false;
+bool playerstarted = false;
 
 extern esp_err_t audio_set_mute(bool mute);
 
@@ -263,6 +272,79 @@ int deinit_player(void) {
 }
 
 /**
+ * ensure this is called after http_task was killed!
+ */
+int stop_player(void) {
+  int ret = 0;
+
+  // stop the task
+  if (playerTaskHandle == NULL) {
+    ESP_LOGW(TAG, "no sync task created?");
+  } else {
+    vTaskDelete(playerTaskHandle);
+    playerTaskHandle = NULL;
+  }
+
+  ret = destroy_pcm_queue(&pcmChkQHdl);
+
+  tg0_timer_deinit();
+#if CONFIG_PM_ENABLE
+    esp_pm_lock_release(s_pm_apb_lock);
+    ESP_LOGI(TAG, "PM enabled");
+#endif //CONFIG_PM_ENABLE
+  ESP_LOGI(TAG, "stop player done");
+
+  return ret;
+}
+
+int start_player(void) {
+    if (playerstarted){
+        return -1;
+    }
+    playerstarted = true;
+#if CONFIG_PM_ENABLE
+    esp_pm_lock_acquire(s_pm_apb_lock);
+    ESP_LOGI(TAG, "PM disabled");
+#endif //CONFIG_PM_ENABLE
+  int ret = 0;
+
+  if (snapcastSettingsMux == NULL) {
+    snapcastSettingsMux = xSemaphoreCreateMutex();
+    xSemaphoreGive(snapcastSettingsMux);
+  }
+
+  if (playerPcmQueueMux == NULL) {
+    playerPcmQueueMux = xSemaphoreCreateMutex();
+    xSemaphoreGive(playerPcmQueueMux);
+  }
+
+  ret = player_setup_i2s(I2S_NUM_0, &currentSnapcastSetting);
+  if (ret < 0) {
+    ESP_LOGE(TAG, "player_setup_i2s failed: %d", ret);
+
+    return -1;
+  }
+
+  // create semaphore for time diff buffer to server
+  if (latencyBufSemaphoreHandle == NULL) {
+    latencyBufSemaphoreHandle = xSemaphoreCreateMutex();
+  }
+
+  tg0_timer_init();
+
+    ESP_LOGI(TAG, "Start player_task");
+
+    xTaskCreatePinnedToCore(player_task, "player", 2048 + 512, NULL,
+                            SYNC_TASK_PRIORITY, &playerTaskHandle,
+                            SYNC_TASK_CORE_ID);
+  
+
+  ESP_LOGI(TAG, "start player done");
+
+  return 0;
+}
+
+/**
  *  call before http task creation!
  */
 int init_player(void) {
@@ -311,17 +393,14 @@ int init_player(void) {
   miniMedianFilter.numNodes = MINI_BUFFER_LEN;
   miniMedianFilter.medianBuffer = miniMedianBuffer;
   MEDIANFILTER_Init(&miniMedianFilter);
-
-  tg0_timer_init();
-
-  if (playerTaskHandle == NULL) {
-    ESP_LOGI(TAG, "Start player_task");
-
-    xTaskCreatePinnedToCore(player_task, "player", 2048 + 512, NULL,
-                            SYNC_TASK_PRIORITY, &playerTaskHandle,
-                            SYNC_TASK_CORE_ID);
-  }
-
+  
+#if CONFIG_PM_ENABLE
+  if (s_pm_apb_lock == NULL) {
+        if (esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "l_apb", &s_pm_apb_lock) != ESP_OK) {
+            ESP_LOGE(TAG, "esp pm lock create failed");
+        }
+    }
+#endif //CONFIG_PM_ENABLE
   ESP_LOGI(TAG, "init player done");
 
   return 0;
@@ -401,10 +480,6 @@ int32_t player_send_snapcast_setting(snapcastSetting_t *setting) {
   snapcastSetting_t curSet;
   uint8_t settingChanged = 1;
 
-  if ((playerTaskHandle == NULL) || (snapcastSettingQueueHandle == NULL)) {
-    return pdFAIL;
-  }
-
   ret = player_get_snapcast_settings(&curSet);
 
   if ((curSet.bits != setting->bits) || (curSet.buf_ms != setting->buf_ms) ||
@@ -430,14 +505,17 @@ int32_t player_send_snapcast_setting(snapcastSetting_t *setting) {
           (curSet.codec == setting->codec) && (curSet.sr == setting->sr) &&
           (curSet.cDacLat_ms == setting->cDacLat_ms))) == false) {
       // notify needed
-      ret = xQueueOverwrite(snapcastSettingQueueHandle, &settingChanged);
-      if (ret != pdPASS) {
-        ESP_LOGE(TAG,
-                 "player_send_snapcast_setting: couldn't notify "
-                 "snapcast setting");
+      if ((playerTaskHandle != NULL) && (snapcastSettingQueueHandle != NULL)) {
+          ret = xQueueOverwrite(snapcastSettingQueueHandle, &settingChanged);
+          if (ret != pdPASS) {
+            ESP_LOGE(TAG,
+                     "player_send_snapcast_setting: couldn't notify "
+                     "snapcast setting");
+          }
       }
     }
   }
+  gotSettings = true;
 
   return pdPASS;
 }
@@ -983,8 +1061,8 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
   if (isFull == false) {
     free_pcm_chunk(pcmChunk);
 
-    //    ESP_LOGW(TAG, "%s: wait for initial latency measurement to finish",
-    //    __func__);
+        ESP_LOGW(TAG, "%s: wait for initial latency measurement to finish",
+        __func__);
 
     return -3;
   }
@@ -996,6 +1074,13 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
     free_pcm_chunk(pcmChunk);
 
     xSemaphoreGive(playerPcmQueueMux);
+
+    int ret;
+    snapcastSetting_t curSet;
+    player_get_snapcast_settings(&curSet);
+    if (!curSet.muted && gotSettings) {
+        start_player();
+    }
 
     return -2;
   }
@@ -1057,12 +1142,12 @@ static void player_task(void *pvParameters) {
   int64_t buf_us = 0;
   pcm_chunk_fragment_t *fragment = NULL;
   size_t written;
-  bool gotSnapserverConfig = false;
   int64_t clientDacLatency_us = 0;
   int64_t diff2Server;
   int64_t outputBufferDacTime = 0;
 
   memset(&scSet, 0, sizeof(snapcastSetting_t));
+  player_get_snapcast_settings(&scSet);
 
   ESP_LOGI(TAG, "started sync task");
 
@@ -1074,6 +1159,35 @@ static void player_task(void *pvParameters) {
   initialSync = 0;
 
   audio_set_mute(true);
+
+  buf_us = (int64_t)(scSet.buf_ms) * 1000LL;
+
+  chkDur_us =
+        (int64_t)scSet.chkInFrames * (int64_t)1E6 / (int64_t)scSet.sr;
+
+    // this value is highly coupled with I2S DMA buffer
+    // size. DMA buffer has a size of 1 chunk (e.g. 20ms)
+    // so next chunk we get from queue will be -20ms
+  outputBufferDacTime = chkDur_us * CHNK_CTRL_CNT;
+
+  clientDacLatency_us = (int64_t)scSet.cDacLat_ms * 1000;
+  // force adjust_apll() to set playback speed
+  currentDir = 1;
+  adjust_apll(0);
+
+  i2s_custom_set_clk(I2S_NUM_0, scSet.sr, scSet.bits, scSet.ch);
+  if (pcmChkQHdl == NULL) {
+      int entries = ceil(((float)scSet.sr / (float)scSet.chkInFrames) *
+                         ((float)scSet.buf_ms / 1000));
+
+      entries -=
+          CHNK_CTRL_CNT;  // CHNK_CTRL_CNT chunks are placed in DMA buffer
+                          // anyway so we can save this much RAM here
+
+      pcmChkQHdl = xQueueCreate(entries, sizeof(pcm_chunk_message_t *));
+
+      ESP_LOGI(TAG, "created new queue with %d", entries);
+    }
 
   while (1) {
     // ESP_LOGW( TAG, "32b f %d b %d", heap_caps_get_free_size
@@ -1154,15 +1268,8 @@ static void player_task(void *pvParameters) {
 
         scSet = __scSet;  // store for next round
 
-        gotSnapserverConfig = true;
       }
 
-    } else if (gotSnapserverConfig == false) {
-      //      ESP_LOGW(TAG, "no snapserver config yet, keep waiting");
-
-      vTaskDelay(pdMS_TO_TICKS(100));
-
-      continue;
     }
 
     // wait for early time syncs to be ready
@@ -1174,7 +1281,7 @@ static void player_task(void *pvParameters) {
       if (is_full == false) {
         vTaskDelay(pdMS_TO_TICKS(10));
 
-        // ESP_LOGW(TAG, "diff buffer not full");
+        ESP_LOGW(TAG, "diff buffer not full");
 
         continue;
       }
@@ -1624,6 +1731,28 @@ static void player_task(void *pvParameters) {
       audio_set_mute(true);
 
       i2s_custom_stop(I2S_NUM_0);
+      
+      break;
     }
   }
+    ret = 0;
+
+    xSemaphoreTake(snapcastSettingsMux, portMAX_DELAY);
+    // delete the queue
+    vQueueDelete(snapcastSettingQueueHandle);
+    snapcastSettingQueueHandle = NULL;
+    xSemaphoreGive(snapcastSettingsMux);
+    
+
+
+  ret = destroy_pcm_queue(&pcmChkQHdl);
+
+  tg0_timer_deinit();
+#if CONFIG_PM_ENABLE
+    esp_pm_lock_release(s_pm_apb_lock);
+    ESP_LOGI(TAG, "PM enabled");
+#endif //CONFIG_PM_ENABLE
+  playerstarted = false;
+  ESP_LOGI(TAG, "stop player done");
+  vTaskDelete(NULL);
 }
