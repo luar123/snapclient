@@ -270,10 +270,7 @@ int deinit_player(void) {
 
   return ret;
 }
-
 /**
- * ensure this is called after http_task was killed!
- */
 int stop_player(void) {
   int ret = 0;
 
@@ -295,9 +292,9 @@ int stop_player(void) {
   ESP_LOGI(TAG, "stop player done");
 
   return ret;
-}
+}**/
 
-int start_player(void) {
+int start_player(snapcastSetting_t *setting) {
     if (playerstarted){
         return -1;
     }
@@ -308,26 +305,11 @@ int start_player(void) {
 #endif //CONFIG_PM_ENABLE
   int ret = 0;
 
-  if (snapcastSettingsMux == NULL) {
-    snapcastSettingsMux = xSemaphoreCreateMutex();
-    xSemaphoreGive(snapcastSettingsMux);
-  }
-
-  if (playerPcmQueueMux == NULL) {
-    playerPcmQueueMux = xSemaphoreCreateMutex();
-    xSemaphoreGive(playerPcmQueueMux);
-  }
-
-  ret = player_setup_i2s(I2S_NUM_0, &currentSnapcastSetting);
+  ret = player_setup_i2s(I2S_NUM_0, setting);
   if (ret < 0) {
     ESP_LOGE(TAG, "player_setup_i2s failed: %d", ret);
 
     return -1;
-  }
-
-  // create semaphore for time diff buffer to server
-  if (latencyBufSemaphoreHandle == NULL) {
-    latencyBufSemaphoreHandle = xSemaphoreCreateMutex();
   }
 
   tg0_timer_init();
@@ -1061,8 +1043,8 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
   if (isFull == false) {
     free_pcm_chunk(pcmChunk);
 
-        ESP_LOGW(TAG, "%s: wait for initial latency measurement to finish",
-        __func__);
+        //ESP_LOGW(TAG, "%s: wait for initial latency measurement to finish",
+        //__func__);
 
     return -3;
   }
@@ -1079,7 +1061,7 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
     snapcastSetting_t curSet;
     player_get_snapcast_settings(&curSet);
     if (!curSet.muted && gotSettings) {
-        start_player();
+        start_player(&curSet);
     }
 
     return -2;
@@ -1095,8 +1077,8 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
 
   // if (xQueueSend(pcmChkQHdl, &pcmChunk, pdMS_TO_TICKS(10)) != pdTRUE) {
   if (xQueueSend(pcmChkQHdl, &pcmChunk, pdMS_TO_TICKS(1)) != pdTRUE) {
-    ESP_LOGW(TAG, "send: pcmChunkQueue full, messages waiting %d",
-             uxQueueMessagesWaiting(pcmChkQHdl));
+    //ESP_LOGW(TAG, "send: pcmChunkQueue full, messages waiting %d",
+             //uxQueueMessagesWaiting(pcmChkQHdl));
 
     free_pcm_chunk(pcmChunk);
   }
@@ -1145,6 +1127,10 @@ static void player_task(void *pvParameters) {
   int64_t clientDacLatency_us = 0;
   int64_t diff2Server;
   int64_t outputBufferDacTime = 0;
+
+  while(reset_latency_buffer()<0) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
 
   memset(&scSet, 0, sizeof(snapcastSetting_t));
   player_get_snapcast_settings(&scSet);
@@ -1281,7 +1267,7 @@ static void player_task(void *pvParameters) {
       if (is_full == false) {
         vTaskDelay(pdMS_TO_TICKS(10));
 
-        ESP_LOGW(TAG, "diff buffer not full");
+        //ESP_LOGW(TAG, "diff buffer not full");
 
         continue;
       }

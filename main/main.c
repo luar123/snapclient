@@ -804,7 +804,7 @@ static void http_get_task(void *pvParameters) {
     }
 
     timeout = FAST_SYNC_LATENCY_BUF;
-
+/** never true
     esp_timer_stop(timeSyncMessageTimer);
     if (received_header == true) {
       if (!esp_timer_is_active(timeSyncMessageTimer)) {
@@ -821,7 +821,7 @@ static void http_get_task(void *pvParameters) {
         esp_timer_start_periodic(timeSyncMessageTimer, timeout);
       }
     }
-
+**/
     if (opusDecoder != NULL) {
       opus_decoder_destroy(opusDecoder);
       opusDecoder = NULL;
@@ -2238,7 +2238,7 @@ static void http_get_task(void *pvParameters) {
                           esp_timer_start_periodic(timeSyncMessageTimer,
                                                    timeout);
                         }
-
+/** useless
                         bool is_full = false;
                         latency_buffer_full(&is_full, portMAX_DELAY);
                         if ((is_full == true) &&
@@ -2249,7 +2249,7 @@ static void http_get_task(void *pvParameters) {
 
                           esp_timer_start_periodic(timeSyncMessageTimer,
                                                    timeout);
-                        }
+                        } **/
                       }
 
                       break;
@@ -2663,7 +2663,7 @@ static void http_get_task(void *pvParameters) {
                               esp_timer_start_periodic(timeSyncMessageTimer,
                                                        timeout);
                             }
-
+/** useless
                             bool is_full = false;
                             latency_buffer_full(&is_full, portMAX_DELAY);
                             if ((is_full == true) &&
@@ -2674,7 +2674,7 @@ static void http_get_task(void *pvParameters) {
 
                               esp_timer_start_periodic(timeSyncMessageTimer,
                                                        timeout);
-                            }
+                            } **/
                           }
                         }
 
@@ -2699,6 +2699,19 @@ static void http_get_task(void *pvParameters) {
                             timeout = NORMAL_SYNC_LATENCY_BUF;
 
                             ESP_LOGI(TAG, "latency buffer full");
+
+                            if (esp_timer_is_active(timeSyncMessageTimer)) {
+                              esp_timer_stop(timeSyncMessageTimer);
+                            }
+
+                            esp_timer_start_periodic(timeSyncMessageTimer,
+                                                     timeout);
+                          }
+                          else if ((is_full == false) &&
+                              (timeout > FAST_SYNC_LATENCY_BUF)){
+                            timeout = FAST_SYNC_LATENCY_BUF;
+
+                            ESP_LOGI(TAG, "latency buffer not full");
 
                             if (esp_timer_is_active(timeSyncMessageTimer)) {
                               esp_timer_stop(timeSyncMessageTimer);
