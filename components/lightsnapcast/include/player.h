@@ -14,6 +14,7 @@
 #define CHNK_CTRL_CNT 2
 
 #define LATENCY_MEDIAN_FILTER_LEN 199
+#define LATENCY_MEDIAN_FILTER_FULL 19
 
 // set to 0 if you do not wish to be the median an average around actual
 // median average will be (LATENCY_MEDIAN_FILTER_LEN /
@@ -59,8 +60,8 @@ typedef struct snapcastSetting_s {
 
 int init_player(void);
 int deinit_player(void);
-int restart_player(void);
-int stop_player(void);
+int start_player(snapcastSetting_t *setting);
+//int stop_player(void);
 
 int32_t allocate_pcm_chunk_memory(pcm_chunk_message_t **pcmChunk, size_t bytes);
 int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk);

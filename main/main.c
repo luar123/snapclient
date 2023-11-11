@@ -81,6 +81,11 @@ static QueueHandle_t decoderTaskQHdl = NULL;
 SemaphoreHandle_t decoderReadSemaphore = NULL;
 SemaphoreHandle_t decoderWriteSemaphore = NULL;
 
+#if CONFIG_PM_ENABLE
+    static esp_pm_lock_handle_t s_pm_apb_lock = NULL;
+    static esp_pm_lock_handle_t s_pm_ls_lock = NULL;
+#endif
+
 const char *VERSION_STRING = "0.0.2";
 
 #define HTTP_TASK_PRIORITY (configMAX_PRIORITIES - 2)  // 9
@@ -750,6 +755,35 @@ esp_err_t audio_set_mute(bool mute) {
   } else {
     return audio_hal_set_mute(board_handle->audio_hal, mute);
   }
+}
+
+#include "MedianFilter.h"
+
+xTaskHandle t_testask = NULL;
+
+static void testask(void *pvParameters) {
+    static sMedianFilter_t latencyMedianFilter;
+    static sMedianNode_t latencyMedianLong[19];
+    latencyMedianFilter.numNodes = 19;
+    latencyMedianFilter.medianBuffer = latencyMedianLong;
+    MEDIANFILTER_Init(&latencyMedianFilter);
+    vTaskDelay(3000);
+    int64_t newValue=esp_random();
+    for (int i=0; i<20; i++){
+        newValue=esp_random();
+        MEDIANFILTER_Insert(&latencyMedianFilter, newValue);
+    }
+    newValue=esp_random();
+    while(1) {
+        newValue++;
+        ESP_LOGI(TAG, "sample: %lld", newValue);
+        MEDIANFILTER_Insert(&latencyMedianFilter, newValue);
+        MEDIANFILTER_log(&latencyMedianFilter);
+        
+        vTaskDelay(1000);
+        
+    
+}
 }
 
 /**
@@ -2638,9 +2672,11 @@ static void http_get_task(void *pvParameters) {
                         ttx = (int64_t)base_message_rx.sent.sec * 1000000LL +
                               (int64_t)base_message_rx.sent.usec;
                         tdif = trx - ttx;
+                        //ESP_LOGI(TAG, "trx: %lld, ttx: %lld", trx, ttx);
                         trx = (int64_t)time_message_rx.latency.sec * 1000000LL +
                               (int64_t)time_message_rx.latency.usec;
                         tmpDiffToServer = (trx - tdif) / 2;
+                        //ESP_LOGI(TAG, "latency tx:%lld, rx: %lld", trx, tdif);
 
                         int64_t diff;
 
@@ -2816,12 +2852,11 @@ void app_main(void) {
   
   // enable power management
 #if CONFIG_PM_ENABLE
-    static esp_pm_lock_handle_t s_pm_apb_lock   = NULL;
     //Configure dynamic frequency scaling:
     //automatic light sleep is enabled if tickless idle support is enabled.
     esp_pm_config_esp32_t pm_config = {
-        .max_freq_mhz = 240, //Maximum CPU frequency
-        .min_freq_mhz = 40,  //Minimum CPU frequency
+        .max_freq_mhz = 80, //Maximum CPU frequency
+        .min_freq_mhz = 10,  //Minimum CPU frequency
 #if CONFIG_FREERTOS_USE_TICKLESS_IDLE
         .light_sleep_enable = true
 #endif
@@ -2833,7 +2868,13 @@ void app_main(void) {
             ESP_LOGE(TAG, "esp pm lock create failed");
         }
     }
+    if (s_pm_ls_lock == NULL) {
+        if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "l_ls", &s_pm_ls_lock) != ESP_OK) {
+            ESP_LOGE(TAG, "esp pm lock create failed");
+        }
+    }
     ESP_ERROR_CHECK(esp_pm_lock_acquire(s_pm_apb_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(s_pm_ls_lock));
     ESP_LOGI(TAG, "PM disabled");
 #endif //CONFIG_PM_ENABLE
 
@@ -2939,6 +2980,7 @@ void app_main(void) {
 #endif
 #if CONFIG_PM_ENABLE
     esp_pm_lock_release(s_pm_apb_lock);
+    esp_pm_lock_release(s_pm_ls_lock);
     ESP_LOGI(TAG, "PM enabled");
 #endif //CONFIG_PM_ENABLE
   xTaskCreatePinnedToCore(&ota_server_task, "ota", 14 * 256, NULL,
@@ -2947,7 +2989,11 @@ void app_main(void) {
   xTaskCreatePinnedToCore(&http_get_task, "http", 4 * 1024, NULL,
                           HTTP_TASK_PRIORITY, &t_http_get_task,
                           HTTP_TASK_CORE_ID);
-
+    /**                      
+    xTaskCreatePinnedToCore(&testask, "test", 4 * 1024, NULL,
+                          HTTP_TASK_PRIORITY, &t_testask,
+                          HTTP_TASK_CORE_ID);
+**/
   //  while (1) {
   //    // audio_event_iface_msg_t msg;
   //    vTaskDelay(portMAX_DELAY);  //(pdMS_TO_TICKS(5000));
@@ -2961,3 +3007,5 @@ void app_main(void) {
   //    }
   //  }
 }
+
+

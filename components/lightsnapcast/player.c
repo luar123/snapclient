@@ -85,6 +85,7 @@ static void tg0_timer_deinit(void);
 static void player_task(void *pvParameters);
 #if CONFIG_PM_ENABLE
 static esp_pm_lock_handle_t s_pm_apb_lock   = NULL;
+static esp_pm_lock_handle_t s_pm_ls_lock   = NULL;
 #endif //CONFIG_PM_ENABLE
 
 bool gotSettings = false;
@@ -301,6 +302,7 @@ int start_player(snapcastSetting_t *setting) {
     playerstarted = true;
 #if CONFIG_PM_ENABLE
     esp_pm_lock_acquire(s_pm_apb_lock);
+    esp_pm_lock_acquire(s_pm_ls_lock);
     ESP_LOGI(TAG, "PM disabled");
 #endif //CONFIG_PM_ENABLE
   int ret = 0;
@@ -377,6 +379,11 @@ int init_player(void) {
   MEDIANFILTER_Init(&miniMedianFilter);
   
 #if CONFIG_PM_ENABLE
+  if (s_pm_ls_lock == NULL) {
+        if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "l_ls", &s_pm_ls_lock) != ESP_OK) {
+            ESP_LOGE(TAG, "esp pm lock create failed");
+        }
+    }
   if (s_pm_apb_lock == NULL) {
         if (esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "l_apb", &s_pm_apb_lock) != ESP_OK) {
             ESP_LOGE(TAG, "esp pm lock create failed");
@@ -426,7 +433,7 @@ int32_t player_latency_insert(int64_t newValue) {
 
   medianValue = MEDIANFILTER_Insert(&latencyMedianFilter, newValue);
   if (xSemaphoreTake(latencyBufSemaphoreHandle, pdMS_TO_TICKS(0)) == pdTRUE) {
-    if (MEDIANFILTER_isFull(&latencyMedianFilter)) {
+    if (MEDIANFILTER_isFull(&latencyMedianFilter, LATENCY_MEDIAN_FILTER_FULL)) {
       latencyBuffFull = true;
 
       //      ESP_LOGI(TAG, "(full) latency median: %lldus", medianValue);
@@ -1127,6 +1134,7 @@ static void player_task(void *pvParameters) {
   int64_t clientDacLatency_us = 0;
   int64_t diff2Server;
   int64_t outputBufferDacTime = 0;
+  //int count=0;
 
   while(reset_latency_buffer()<0) {
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -1306,6 +1314,7 @@ static void player_task(void *pvParameters) {
 
         //        ESP_LOGE(TAG,"age: %lld, serverNow %lld, chunkStart %lld,
         //        buf_us %lld", age, serverNow, chunkStart, buf_us);
+
 
         if (initialSync == 1) {
           // on initialSync == 0 (hard sync) we don't have any data in i2s DMA
@@ -1507,10 +1516,15 @@ static void player_task(void *pvParameters) {
         //        xSemaphoreTake(playerPcmQueueMux, portMAX_DELAY);
         int msgWaiting = uxQueueMessagesWaiting(pcmChkQHdl);
         //        xSemaphoreGive(playerPcmQueueMux);
-
+        /**
+        count++;
+        if (count>=10) {
+            count=0;
+                        ESP_LOGI(TAG,"age: %lld, shortM %lld, miniM %lld", age, shortMedian, miniMedian);
+        }**/
         // resync hard if we are getting very late / early.
         // rest gets tuned in through apll speed control
-        if ((msgWaiting == 0) || (MEDIANFILTER_isFull(&shortMedianFilter) &&
+        if ((msgWaiting == 0) || (MEDIANFILTER_isFull(&shortMedianFilter,0) &&
                                   (abs(shortMedian) > hardResyncThreshold)))
         //        if (msgWaiting == 0)
         {
@@ -1560,7 +1574,7 @@ static void player_task(void *pvParameters) {
 
 #if USE_SAMPLE_INSERTION  // WIP: insert samples to adjust sync
         if ((enableControlLoop == true) &&
-            (MEDIANFILTER_isFull(&shortMedianFilter))) {
+            (MEDIANFILTER_isFull(&shortMedianFilter,0))) {
           if (avg < -miniOffset) {  // we are early
             dir = -1;
             dir_insert_sample = -1;
@@ -1571,7 +1585,7 @@ static void player_task(void *pvParameters) {
         }
 #else  // use APLL to adjust sync
         if ((enableControlLoop == true) &&
-            (MEDIANFILTER_isFull(&shortMedianFilter))) {
+            (MEDIANFILTER_isFull(&shortMedianFilter,0))) {
           if ((shortMedian < -shortOffset) && (miniMedian < -miniOffset) &&
               (avg < -miniOffset)) {  // we are early
             dir = -1;
@@ -1736,6 +1750,7 @@ static void player_task(void *pvParameters) {
   tg0_timer_deinit();
 #if CONFIG_PM_ENABLE
     esp_pm_lock_release(s_pm_apb_lock);
+    esp_pm_lock_release(s_pm_ls_lock);
     ESP_LOGI(TAG, "PM enabled");
 #endif //CONFIG_PM_ENABLE
   playerstarted = false;
