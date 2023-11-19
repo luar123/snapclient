@@ -763,21 +763,39 @@ xTaskHandle t_testask = NULL;
 
 static void testask(void *pvParameters) {
     static sMedianFilter_t latencyMedianFilter;
-    static sMedianNode_t latencyMedianLong[19];
-    latencyMedianFilter.numNodes = 19;
+    static sMedianNode_t latencyMedianLong[9];
+    latencyMedianFilter.numNodes = 9;
     latencyMedianFilter.medianBuffer = latencyMedianLong;
     MEDIANFILTER_Init(&latencyMedianFilter);
     vTaskDelay(3000);
     int64_t newValue=esp_random();
     for (int i=0; i<20; i++){
         newValue=esp_random();
-        MEDIANFILTER_Insert(&latencyMedianFilter, newValue);
+        //MEDIANFILTER_Insert(&latencyMedianFilter, newValue);
     }
-    newValue=esp_random();
+    MEDIANFILTER_Insert(&latencyMedianFilter, 0);
+    MEDIANFILTER_Insert(&latencyMedianFilter, 10);
+    MEDIANFILTER_Insert(&latencyMedianFilter, 20);
+    MEDIANFILTER_Insert(&latencyMedianFilter, 11);
+    MEDIANFILTER_Insert(&latencyMedianFilter, 19);
+    MEDIANFILTER_Insert(&latencyMedianFilter, 12);
+    MEDIANFILTER_Insert(&latencyMedianFilter, 18);
+    MEDIANFILTER_log(&latencyMedianFilter);
+    ESP_LOGI(TAG, "sample: %lld", MEDIANFILTER_get_median(&latencyMedianFilter,0));
+    ESP_LOGI(TAG, "sample: %lld", MEDIANFILTER_get_median(&latencyMedianFilter,1));
+    ESP_LOGI(TAG, "sample: %lld", MEDIANFILTER_get_median(&latencyMedianFilter,2));
+    ESP_LOGI(TAG, "sample: %lld", MEDIANFILTER_get_median(&latencyMedianFilter,3));
+    ESP_LOGI(TAG, "sample: %lld", MEDIANFILTER_get_median(&latencyMedianFilter,4));
+    ESP_LOGI(TAG, "sample: %lld", MEDIANFILTER_get_median(&latencyMedianFilter,5));
+    ESP_LOGI(TAG, "sample: %lld", MEDIANFILTER_get_median(&latencyMedianFilter,6));
+    MEDIANFILTER_Insert(&latencyMedianFilter, 13);
+    MEDIANFILTER_Insert(&latencyMedianFilter, 18);
+    MEDIANFILTER_Insert(&latencyMedianFilter, 14);
+    MEDIANFILTER_log(&latencyMedianFilter);
     while(1) {
         newValue++;
         ESP_LOGI(TAG, "sample: %lld", newValue);
-        MEDIANFILTER_Insert(&latencyMedianFilter, newValue);
+        newValue=MEDIANFILTER_Insert(&latencyMedianFilter, newValue);
         MEDIANFILTER_log(&latencyMedianFilter);
         
         vTaskDelay(1000);
@@ -2989,7 +3007,7 @@ void app_main(void) {
   xTaskCreatePinnedToCore(&http_get_task, "http", 4 * 1024, NULL,
                           HTTP_TASK_PRIORITY, &t_http_get_task,
                           HTTP_TASK_CORE_ID);
-    /**                      
+    /**
     xTaskCreatePinnedToCore(&testask, "test", 4 * 1024, NULL,
                           HTTP_TASK_PRIORITY, &t_testask,
                           HTTP_TASK_CORE_ID);

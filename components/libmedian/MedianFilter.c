@@ -128,30 +128,33 @@ int64_t MEDIANFILTER_get_median(sMedianFilter_t *medianFilter, uint32_t n) {
   int64_t avgMedian = 0;
   sMedianNode_t *it;
   int32_t i;
+  if (n >= medianFilter->bufferCnt) {
+      n = (((medianFilter->bufferCnt-1)<<1)>>1);
+  }
 
-  if ((n % 2) == 0) {
-    it = medianFilter->medianHead
-             ->prevValue;  // set iterator as value head previous
-    // first add previous values
-    for (i = 0; i < n / 2; i++) {
-      avgMedian += it->value;
-      it = medianFilter->medianHead->prevValue;
-    }
+  // n should not include the center value
+  if ((n % 2) != 0) {
+      n--;
+  }
 
-    it =
-        medianFilter->medianHead->nextValue;  // set iterator as value head next
+  it = medianFilter->medianHead
+           ->prevValue;  // set iterator as value head previous
+  // first add previous values
+  for (i = 0; i < n / 2; i++) {
+    avgMedian += it->value;
+    it = it->prevValue;
+  }
+
+  it =
+      medianFilter->medianHead->nextValue;  // set iterator as value head next
     // second add next values
-    for (i = 0; i < n / 2; i++) {
-      avgMedian += it->value;
-      it = medianFilter->medianHead->nextValue;
-    }
+  for (i = 0; i < n / 2; i++) {
+    avgMedian += it->value;
+    it = it->nextValue;
   }
 
   avgMedian += medianFilter->medianHead->value;
-
-  if (n > 0) {
-    avgMedian /= (n + 1);
-  }
+  avgMedian /= (n + 1);
 
   return avgMedian;
 }
