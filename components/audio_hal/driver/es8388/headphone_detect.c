@@ -42,7 +42,7 @@
 #define HP_DELAY_TIME_MS 1000
 
 static const char *TAG = "HEADPHONE";
-static xTimerHandle timer_headphone;
+static TimerHandle_t timer_headphone;
 
 static void hp_timer_cb(TimerHandle_t xTimer) {
   int num = (int)pvTimerGetTimerID(xTimer);

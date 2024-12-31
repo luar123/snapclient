@@ -1,6 +1,10 @@
 #ifndef _DSP_PROCESSOR_H_
 #define _DSP_PROCESSOR_H_
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include "esp_err.h"
 
 typedef enum dspFlows {
@@ -63,5 +67,9 @@ void dsp_processor_uninit(void);
 int dsp_processor_worker(char *audio, size_t chunk_size, uint32_t samplerate);
 esp_err_t dsp_processor_update_filter_params(filterParams_t *params);
 void dsp_processor_set_volome(double volume);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _DSP_PROCESSOR_H_  */

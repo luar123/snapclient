@@ -1,6 +1,10 @@
 #ifndef __SNAPCAST_H__
 #define __SNAPCAST_H__
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -114,5 +118,7 @@ typedef struct time_message
 int time_message_serialize (time_message_t *msg, char *data, uint32_t size);
 int time_message_deserialize (time_message_t *msg, const char *data,
                               uint32_t size);
-
+#ifdef __cplusplus
+}
+#endif
 #endif // __SNAPCAST_H__
