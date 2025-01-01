@@ -1,0 +1,45 @@
+esphome:
+  name: snapcast
+
+esp32:
+  board: esp32dev
+  partitions: partitions.csv
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_AUDIO_BOARD_CUSTOM: y
+      CONFIG_DAC_PCM5102A: y
+      CONFIG_MASTER_I2S_BCK_PIN: "23"
+      CONFIG_MASTER_I2S_LRCK_PIN: "13"
+      CONFIG_MASTER_I2S_DATAOUT_PIN: "14"
+      CONFIG_PCM5102A_MUTE_PIN: "18"
+      CONFIG_DAC_I2C_SDA: "0"
+      CONFIG_DAC_I2C_SCL: "0"
+
+external_components:
+  - source: components
+    components: [ snapclient ]
+
+network:
+    enable_ipv6: true
+
+wifi:
+  ssid: !secret ssid
+  password: !secret password
+
+api:
+
+ota:
+  - platform: esphome
+
+# Enable logging
+logger:
+  level: debug
+  logs:
+    wifi: info
+    api: info
+    mdns: info
+
+snapclient:
+    hostname: !secret snap_host
+    name: esp-tester
