@@ -1,5 +1,5 @@
 esphome:
-  name: snapcast
+  name: snapcast_dac
 
 esp32:
   board: esp32dev
@@ -36,8 +36,16 @@ i2s_audio:
   i2s_bclk_pin: 23
   i2s_lrclk_pin: 13
 
+audio_dac:
+  - platform: es8311
+    id: dac
+
+i2c:
+  sda: 1
+  scl: 2
+
 snapclient:
   hostname: !secret snap_host
-  name: esp-tester
-  mute_pin: 18
+  name: esphome-test
   i2s_dout_pin: 14
+  audio_dac: dac
