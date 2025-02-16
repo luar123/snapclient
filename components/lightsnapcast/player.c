@@ -139,6 +139,24 @@ esp_err_t my_i2s_channel_enable(i2s_chan_handle_t handle) {
  */
 static esp_err_t player_setup_i2s(i2s_port_t i2sNum,
                                   snapcastSetting_t *setting) {
+  // ensure save setting
+  int32_t sr = setting->sr;
+  if (sr == 0) {
+    sr = 44100;
+  }
+
+  // ensure save setting
+  int bits = setting->bits;
+  if (bits == 0) {
+    bits = I2S_DATA_BIT_WIDTH_16BIT;
+  }
+
+  // ensure save setting
+  uint32_t chkInFrames = setting->chkInFrames;
+  if (chkInFrames == 0) {
+    chkInFrames = 1152;
+  }
+
 #if USE_SAMPLE_INSERTION
   i2sDmaBufCnt = 22;
   // OPUS has a minimum frame size of 120
@@ -153,7 +171,7 @@ static esp_err_t player_setup_i2s(i2s_port_t i2sNum,
   int __dmaBufLen;
 
   __dmaBufCnt = 1;
-  __dmaBufLen = setting->chkInFrames;
+  __dmaBufLen = chkInFrames;
   while ((__dmaBufLen >= __dmaBufMaxLen) || (__dmaBufCnt <= 1)) {
     if ((__dmaBufLen % 2) == 0) {
       __dmaBufCnt *= 2;
@@ -170,11 +188,11 @@ static esp_err_t player_setup_i2s(i2s_port_t i2sNum,
   i2sDmaBufMaxLen = __dmaBufLen;
 
   // check i2s_set_get_apll_freq() how it is done
-  fi2s_clk = 2 * setting->sr *
+  fi2s_clk = 2 * sr *
              I2S_MCLK_MULTIPLE_256;  // setting->ch * setting->bits * m_scale;
 
-  apll_normal_predefine[0] = setting->bits;
-  apll_normal_predefine[1] = setting->sr;
+  apll_normal_predefine[0] = bits;
+  apll_normal_predefine[1] = sr;
   if (rtc_clk_apll_coeff_calc(
           fi2s_clk, &apll_normal_predefine[5], &apll_normal_predefine[2],
           &apll_normal_predefine[3], &apll_normal_predefine[4]) == 0) {
@@ -184,16 +202,16 @@ static esp_err_t player_setup_i2s(i2s_port_t i2sNum,
 #define UPPER_SR_SCALER 1.0001
 #define LOWER_SR_SCALER 0.9999
 
-  apll_corr_predefine[0][0] = setting->bits;
-  apll_corr_predefine[0][1] = setting->sr * UPPER_SR_SCALER;
+  apll_corr_predefine[0][0] = bits;
+  apll_corr_predefine[0][1] = sr * UPPER_SR_SCALER;
   if (rtc_clk_apll_coeff_calc(
           fi2s_clk * UPPER_SR_SCALER, &apll_corr_predefine[0][5],
           &apll_corr_predefine[0][2], &apll_corr_predefine[0][3],
           &apll_corr_predefine[0][4]) == 0) {
     ESP_LOGE(TAG, "ERROR, fi2s_clk * %f", UPPER_SR_SCALER);
   }
-  apll_corr_predefine[1][0] = setting->bits;
-  apll_corr_predefine[1][1] = setting->sr * LOWER_SR_SCALER;
+  apll_corr_predefine[1][0] = bits;
+  apll_corr_predefine[1][1] = sr * LOWER_SR_SCALER;
   if (rtc_clk_apll_coeff_calc(
           fi2s_clk * LOWER_SR_SCALER, &apll_corr_predefine[1][5],
           &apll_corr_predefine[1][2], &apll_corr_predefine[1][3],
@@ -219,18 +237,6 @@ static esp_err_t player_setup_i2s(i2s_port_t i2sNum,
 
   board_i2s_pin_t pin_config0;
   get_i2s_pins(i2sNum, &pin_config0);
-
-  // ensure save setting
-  int32_t sr = setting->sr;
-  if (sr == 0) {
-    sr = 44100;
-  }
-
-  // ensure save setting
-  int bits = setting->bits;
-  if (bits == 0) {
-    bits = I2S_DATA_BIT_WIDTH_16BIT;
-  }
 
   ESP_LOGI(TAG,
            "player_setup_i2s: dma_buf_len is %ld, dma_buf_count is %ld, sample "
