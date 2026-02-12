@@ -36,6 +36,7 @@
 #include "driver/i2s_std.h"
 #include "player.h"
 #include "snapcast.h"
+#include "network_interface.h"
 
 #define USE_SAMPLE_INSERTION CONFIG_USE_SAMPLE_INSERTION
 
@@ -119,6 +120,7 @@ static void player_task(void *pvParameters);
 
 bool gotSettings = false;
 bool playerstarted = false;
+static bool player_shutdown_in_progress = false;  // Guards against restart during shutdown
 
 extern void audio_set_mute(bool mute);
 extern void audio_dac_enable(bool enabled);
@@ -519,12 +521,18 @@ int start_player(snapcastSetting_t *setting) {
     if (playerstarted){
         return -1;
     }
+    // Clear shutdown flag - we're starting a new session
+    player_shutdown_in_progress = false;
     playerstarted = true;
+    if (network_playback_started() != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to signal playback started to network layer");
+    }
   int ret = 0;
 
   ret = player_setup_i2s(setting);
   if (ret < 0) {
     ESP_LOGE(TAG, "player_setup_i2s failed: %d", ret);
+    network_playback_stopped();
     playerstarted = false;
     return -1;
   }
@@ -537,31 +545,40 @@ int start_player(snapcastSetting_t *setting) {
   while(reset_latency_buffer()<0) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
-  
+
   esp_pm_lock_acquire(player_pm_lock_handle);
 #endif
   
   // create message queue to inform task of changed settings
   snapcastSettingQueueHandle = xQueueCreate(1, sizeof(uint8_t));
-  
+
   if (pcmChkQHdl == NULL) 
   {
     snapcastSetting_t scSet;
     memset(&scSet, 0, sizeof(snapcastSetting_t));
     player_get_snapcast_settings(&scSet);
-    
-    // ensure we don't have a divide by zero situation
-    uint32_t chkInFrames = scSet.chkInFrames;
-    if (chkInFrames == 0) {
-      chkInFrames = 1152; // choose a good default for now
+
+    // Guard against divide-by-zero when chkInFrames hasn't been set yet
+    // (can happen during reconnection before first wire chunk is received)
+    if (scSet.chkInFrames == 0) {
+      ESP_LOGW(TAG, "chkInFrames is 0, cannot create queue yet");
+      vQueueDelete(snapcastSettingQueueHandle);
+      snapcastSettingQueueHandle = NULL;
+#if CONFIG_PM_ENABLE
+      esp_pm_lock_release(player_pm_lock_handle);
+#endif
+      tg0_timer_deinit();
+      network_playback_stopped();
+      playerstarted = false;
+      return -1;
     }
-    
-    int entries = ceil(((float)scSet.sr / (float)chkInFrames) *
+
+    int entries = ceil(((float)scSet.sr / (float)scSet.chkInFrames) *
                         ((float)scSet.buf_ms / 1000));
 
     // some chunks are placed in DMA buffer
     // so we can save a little RAM here
-    entries -= ((i2sDmaBufMaxLen * i2sDmaBufCnt) / chkInFrames);
+    entries -= (i2sDmaBufMaxLen * i2sDmaBufCnt) / scSet.chkInFrames;
 
     pcmChkQHdl = xQueueCreate(entries, sizeof(pcm_chunk_message_t *));
 
@@ -1359,6 +1376,13 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
 
     free_pcm_chunk(pcmChunk);
 
+    // Don't try to restart player if shutdown is in progress (prevents race condition
+    // where we try to start player while it's still cleaning up)
+    if (player_shutdown_in_progress) {
+        ESP_LOGD(TAG, "Player shutdown in progress, not restarting");
+        return -2;
+    }
+
     snapcastSetting_t curSet;
     player_get_snapcast_settings(&curSet);
     if (!curSet.muted && gotSettings) {
@@ -2121,6 +2145,10 @@ static void player_task(void *pvParameters) {
   }
   ret = 0;
 
+  // Set shutdown flag BEFORE destroying resources to prevent insert_pcm_chunk
+  // from trying to restart the player during cleanup
+  player_shutdown_in_progress = true;
+
   xSemaphoreTake(snapcastSettingsMux, portMAX_DELAY);
   // delete the queue
   vQueueDelete(snapcastSettingQueueHandle);
@@ -2135,7 +2163,17 @@ static void player_task(void *pvParameters) {
 
   tg0_timer_deinit();
   playerstarted = false;
+  /* Notify network layer that playback stopped so pending Ethernet takeover
+   * can proceed if one was waiting.
+   */
+  if (network_playback_stopped() != ESP_OK) {
+      ESP_LOGW(TAG, "Failed to signal playback stopped to network layer");
+  }
   ESP_LOGI(TAG, "stop player done");
+
+  // Cleanup complete - clear shutdown flag so player can restart
+  player_shutdown_in_progress = false;
+
   playerTaskHandle = NULL;
   vTaskDelete(NULL);
 }

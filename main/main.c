@@ -103,6 +103,7 @@ struct timeval tdif, tavg;
 /* Logging tag */
 static const char *TAG = "SC";
 
+
 // static QueueHandle_t playerChunkQueueHandle = NULL;
 SemaphoreHandle_t timeSyncSemaphoreHandle = NULL;
 
@@ -552,6 +553,13 @@ static void http_get_task(void *pvParameters) {
     }
 
     ESP_LOGI(TAG, "Wait for network connection");
+    
+    // Ensure WiFi is started (may have been stopped if Ethernet was previously active)
+    esp_err_t wifi_err = esp_wifi_start();
+    if (wifi_err != ESP_OK && wifi_err != ESP_ERR_WIFI_STATE) {
+      ESP_LOGW(TAG, "esp_wifi_start() returned %s", esp_err_to_name(wifi_err));
+    }
+    
 #if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
     CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
     esp_netif_t *eth_netif =
@@ -559,27 +567,99 @@ static void http_get_task(void *pvParameters) {
 #endif
     esp_netif_t *sta_netif =
         network_get_netif_from_desc(NETWORK_INTERFACE_DESC_STA);
-    while (1) {
+
+    // If an external module has set a preferred/default netif, prefer it
+    // when it already has an IP. This helps when `eth_interface.c` sets the
+    // default netif to Ethernet — main will then bind/connect using that
+    // default instead of falling back to WiFi.
+    esp_netif_t *default_netif = esp_netif_get_default_netif();
+    if (default_netif != NULL) {
+      if (network_has_ip(default_netif)) {
+        netif = default_netif;
+        ESP_LOGI(TAG, "Using default netif: %s", network_get_ifkey(netif));
+        // Do not stop WiFi here; network selection is purely logical.
+      } else {
+        ESP_LOGI(TAG, "Default netif present but no IP yet: %s", network_get_ifkey(default_netif));
+      }
+    }
+
+    // Wait for network with Ethernet priority
+    // If WiFi comes up first, wait a bit longer to see if Ethernet comes up
+    if (netif == NULL) {
 #if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
     CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
-      bool ethUp = network_is_netif_up(eth_netif);
+      int eth_wait_count = 0;
+      const int ETH_WAIT_MAX = 5;  // Wait up to 5 seconds for Ethernet after WiFi is up
+#endif
+      while (1) {
+      // If an external module requested a reconnect, close any existing
+      // netconn immediately and restart the loop so we re-evaluate the
+      // preferred network interface. This makes reconnects observable in
+      // the logs and reduces the time to rebind to the new default netif.
+      if (network_check_and_clear_reconnect()) {
+        if (lwipNetconn != NULL) {
+          ESP_LOGI(TAG, "Reconnect requested: closing existing netconn (loop start)");
+          netconn_close(lwipNetconn);
+          netconn_delete(lwipNetconn);
+          lwipNetconn = NULL;
+        } else {
+          ESP_LOGI(TAG, "Reconnect requested: no active netconn (loop start)");
+        }
+        if (firstNetBuf != NULL) {
+          netbuf_delete(firstNetBuf);
+          firstNetBuf = NULL;
+        }
+        // Small delay to let network stack settle
+        vTaskDelay(pdMS_TO_TICKS(50));
+      }
+#if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
+    CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
+      bool ethUp = network_has_ip(eth_netif);
 
       if (ethUp) {
         netif = eth_netif;
-
+        ESP_LOGI(TAG, "Using Ethernet interface");
+        // Disable WiFi to save power and avoid interference
+        esp_err_t disc_err = esp_wifi_disconnect();
+        if (disc_err != ESP_OK) {
+          ESP_LOGW(TAG, "esp_wifi_disconnect() returned %s", esp_err_to_name(disc_err));
+        }
+        esp_err_t stop_err = esp_wifi_stop();
+        if (stop_err == ESP_OK) {
+          ESP_LOGI(TAG, "WiFi disabled (Ethernet active)");
+        } else {
+          ESP_LOGW(TAG, "esp_wifi_stop() returned %s", esp_err_to_name(stop_err));
+        }
         break;
       }
 #endif
 
-      bool staUp = network_is_netif_up(sta_netif);
+      bool staUp = network_has_ip(sta_netif);
       if (staUp) {
+#if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
+    CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
+        // Only wait for Ethernet if it's enabled in settings
+        int32_t eth_mode = 0;
+        settings_get_eth_mode(&eth_mode);
+        if (eth_mode > 0) {
+          // WiFi is up but Ethernet isn't - wait a bit for Ethernet
+          if (eth_wait_count < ETH_WAIT_MAX) {
+            ESP_LOGI(TAG, "WiFi up, waiting for Ethernet (%d/%d)...", eth_wait_count + 1, ETH_WAIT_MAX);
+            eth_wait_count++;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+          }
+          ESP_LOGW(TAG, "Ethernet not available, falling back to WiFi");
+        }
+#endif
         netif = sta_netif;
-
+        ESP_LOGI(TAG, "Using WiFi interface");
         break;
       }
 
       vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+      }
+    } // if (netif == NULL)
 
     /* Decide at runtime whether to use mDNS or static server config.
      * The settings_manager holds the mdns flag and optional server host/port.
@@ -623,30 +703,26 @@ static void http_get_task(void *pvParameters) {
       mdns_print_results(r);
       ESP_LOGI(TAG, "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
 
-      mdns_result_t *re = r;
-      while (re) {
-        mdns_ip_addr_t *a = re->addr;
-        if (a == NULL) {
-          // No address in this result, skip to next
-          re = re->next;
-          continue;
-        }
-#if CONFIG_SNAPCLIENT_CONNECT_IPV6
-        if (a->addr.type == IPADDR_TYPE_V6) {
-          netif = re->esp_netif;
-          break;
-        }
-
-        // TODO: fall back to IPv4 if no IPv6 was available
-#else
-        if (a->addr.type == IPADDR_TYPE_V4) {
-          netif = re->esp_netif;
-          break;
-        }
-#endif
-
+    // Find first valid mDNS result with correct address type
+    // Don't change netif - keep using the interface we already verified is UP
+    mdns_result_t *re = r;
+    while (re) {
+      mdns_ip_addr_t *a = re->addr;
+      if (a == NULL) {
         re = re->next;
+        continue;
       }
+#if CONFIG_SNAPCLIENT_CONNECT_IPV6
+      if (a->addr.type == IPADDR_TYPE_V6) {
+        break;  // Found valid IPv6 result
+      }
+#else
+      if (a->addr.type == IPADDR_TYPE_V4) {
+        break;  // Found valid IPv4 result
+      }
+#endif
+      re = re->next;
+    }
 
       if (!re || !re->addr) {
         mdns_query_results_free(r);
@@ -720,9 +796,12 @@ static void http_get_task(void *pvParameters) {
 
 #ifdef USE_INTERFACE_BIND  // use interface to bind connection
     uint8_t netifIdx = esp_netif_get_netif_impl_index(netif);
+    ESP_LOGI(TAG, "Binding netconn to interface %s (idx %u)", network_get_ifkey(netif), netifIdx);
     rc1 = netconn_bind_if(lwipNetconn, netifIdx);
     if (rc1 != ERR_OK) {
-      ESP_LOGE(TAG, "can't bind interface %s", network_get_ifkey(netif));
+      ESP_LOGE(TAG, "can't bind interface %s, err %d", network_get_ifkey(netif), rc1);
+    } else {
+      ESP_LOGI(TAG, "Successfully bound netconn to %s (idx %u)", network_get_ifkey(netif), netifIdx);
     }
 #else  // use IP to bind connection
     if (remote_ip.type == IPADDR_TYPE_V4) {
@@ -738,6 +817,8 @@ static void http_get_task(void *pvParameters) {
 #endif
 //tcp_nagle_disable(pcb)
 
+    ESP_LOGI(TAG, "Connecting to remote %s:%d using local interface %s",
+             ipaddr_ntoa(&remote_ip), remotePort, network_get_ifkey(netif));
     rc2 = netconn_connect(lwipNetconn, &remote_ip, remotePort);
     if (rc2 != ERR_OK) {
       ESP_LOGE(TAG, "can't connect to remote %s:%d, err %d",
@@ -753,6 +834,21 @@ static void http_get_task(void *pvParameters) {
       netconn_delete(lwipNetconn);
       lwipNetconn = NULL;
 
+      continue;
+    }
+
+    // allow external modules to request a reconnect via network_events
+    if (network_check_and_clear_reconnect()) {
+      if (lwipNetconn != NULL) {
+        netconn_close(lwipNetconn);
+        netconn_delete(lwipNetconn);
+        lwipNetconn = NULL;
+      }
+      if (firstNetBuf != NULL) {
+        netbuf_delete(firstNetBuf);
+        firstNetBuf = NULL;
+      }
+      ESP_LOGI(TAG, "Reconnect requested: restarting connection loop");
       continue;
     }
 
@@ -876,12 +972,29 @@ static void http_get_task(void *pvParameters) {
     netconn_set_recvtimeout(lwipNetconn, timeout / 1000); // timeout in ms
 
     while (1) {
+      // Check if external module requested reconnect (e.g., ethernet takeover)
+      if (network_check_and_clear_reconnect()) {
+        ESP_LOGI(TAG, "Reconnect requested during receive loop, breaking out");
+        netconn_close(lwipNetconn);
+        netconn_delete(lwipNetconn);
+        lwipNetconn = NULL;
+        if (firstNetBuf != NULL) {
+          netbuf_delete(firstNetBuf);
+          firstNetBuf = NULL;
+        }
+        // Give server time to detect disconnect and clean up old socket state
+        // before we reconnect (helps with servers that don't handle quick
+        // reconnects from the same client ID on a different interface)
+        ESP_LOGI(TAG, "Waiting 2s for server to clean up old connection...");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        break;
+      }
+
       now = esp_timer_get_time();
       // send time sync message
       if ((received_header && (now - lastTimeSyncSent) >= timeout)) {
         time_sync_msg_cb(NULL);
         lastTimeSyncSent = now;
-        
         // ESP_LOGI(TAG, "time sync sent after %lluus", timeout);
       }
       // start receive
@@ -1455,6 +1568,16 @@ static void http_get_task(void *pvParameters) {
 
                               scSet.chkInFrames = samples_per_frame;
 
+                              // Update player settings BEFORE insert_pcm_chunk
+                              // so start_player() has correct chkInFrames value
+                              if (player_send_snapcast_setting(&scSet) !=
+                                  pdPASS) {
+                                ESP_LOGE(TAG,
+                                         "Failed to notify sync task about "
+                                         "codec. Did you init player?");
+                                return;
+                              }
+
                               // ESP_LOGW(TAG, "%d, %llu, %llu",
                               // samples_per_frame, 1000000ULL *
                               // samples_per_frame / scSet.sr,
@@ -1534,17 +1657,6 @@ static void http_get_task(void *pvParameters) {
                                 insert_pcm_chunk(new_pcmChunk);
                               }
 
-                              if (player_send_snapcast_setting(&scSet) !=
-                                  pdPASS) {
-                                ESP_LOGE(TAG,
-                                         "Failed to notify "
-                                         "sync task about "
-                                         "codec. Did you "
-                                         "init player?");
-
-                                return;
-                              }
-
                               break;
                             }
 
@@ -1597,6 +1709,16 @@ static void http_get_task(void *pvParameters) {
                               // scSet.chkInFrames * scSet.bits / 8 * scSet.ch);
                               // ESP_LOGI(TAG, "new_pcmChunk with size %ld",
                               // new_pcmChunk->totalSize);
+
+                              // Update player settings BEFORE insert_pcm_chunk
+                              // so start_player() has correct chkInFrames value
+                              if (player_send_snapcast_setting(&scSet) !=
+                                  pdPASS) {
+                                ESP_LOGE(TAG,
+                                         "Failed to notify sync task about "
+                                         "codec. Did you init player?");
+                                return;
+                              }
 
                               if (ret == 0) {
                                 pcm_chunk_fragment_t *fragment =
@@ -1657,19 +1779,6 @@ static void http_get_task(void *pvParameters) {
                               free(pcmChunk.outData);
                               pcmChunk.outData = NULL;
                               pcmChunk.bytes = 0;
-
-                              if (player_send_snapcast_setting(&scSet) !=
-                                  pdPASS) {
-                                ESP_LOGE(TAG,
-                                         "Failed to "
-                                         "notify "
-                                         "sync task "
-                                         "about "
-                                         "codec. Did you "
-                                         "init player?");
-
-                                return;
-                              }
 
                               break;
                             }
@@ -2649,6 +2758,7 @@ static void http_get_task(void *pvParameters) {
       } while (netbuf_next(firstNetBuf) >= 0);
 
       netbuf_delete(firstNetBuf);
+      firstNetBuf = NULL;
 
       if (rc1 != ERR_OK) {
         ESP_LOGE(TAG, "Data error, closing netconn");
@@ -2835,6 +2945,12 @@ void app_main(void) {
 
   // Initialize settings manager (hostname + snapserver settings)
   settings_manager_init();
+
+  // Initialize network events (must be before network_if_init)
+  network_events_init();
+
+  // Initialize network interfaces (reads settings during startup)
+  network_if_init();
   
   // Get hostname for mDNS
   char mdns_hostname[64] = {0};

@@ -19,6 +19,7 @@
 #include "freertos/portmacro.h"
 #include "freertos/semphr.h"
 #include "network_interface.h"
+#include "network_interface_priv.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
