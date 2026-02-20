@@ -36,7 +36,6 @@
 #include "driver/i2s_std.h"
 #include "player.h"
 #include "snapcast.h"
-#include "network_interface.h"
 
 #define USE_SAMPLE_INSERTION CONFIG_USE_SAMPLE_INSERTION
 
@@ -118,12 +117,20 @@ static bool gpTimerRunning = false;
 
 static void player_task(void *pvParameters);
 
+//player state
 bool gotSettings = false;
-bool playerstarted = false;
-static bool player_shutdown_in_progress = false;  // Guards against restart during shutdown
+bool playerStarted = false;
+bool playerPaused = false;
+static SemaphoreHandle_t playerStateMux = NULL;
 
-extern void audio_set_mute(bool mute);
-extern void audio_dac_enable(bool enabled);
+typedef struct state_cb_s {
+  void (*cb)(void);
+  struct state_cb_s *next;
+} state_cb_t;
+
+static state_cb_t *state_cb_head = NULL;
+
+static void (*audio_set_mute)(bool mute, bool set_state);
 
 static i2s_chan_handle_t tx_chan = NULL;  // I2S tx channel handler
 static bool i2sEnabled = false;
@@ -392,27 +399,42 @@ int deinit_player(void) {
 
   // must disable i2s before stopping player task or it will hang
   my_i2s_channel_disable(tx_chan);
-  
-  //wait max 10s for task to stop itself
+
+  // Acquire mutex, signal task to stop, then RELEASE before waiting
+  // This avoids deadlock if player task tries to update state
+  TaskHandle_t task_to_delete = NULL;
+  if (playerStateMux != NULL) {
+    xSemaphoreTake(playerStateMux, pdMS_TO_TICKS(10000));
+  }
+  task_to_delete = playerTaskHandle;
+  playerTaskHandle = NULL;  // Signal that we're shutting down
+  if (playerStateMux != NULL) {
+    xSemaphoreGive(playerStateMux);
+  }
+
+  // wait max 10s for task to stop itself (WITHOUT holding mutex)
   for(int i = 0; i< 100; i++) {
-    if (playerstarted) {
+    if (playerStarted) {
       vTaskDelay(pdMS_TO_TICKS(100));
     } else {
       break;
     }
   }
 
-  // stop the task f still running
-  if (playerTaskHandle != NULL) {
-    vTaskDelete(playerTaskHandle);
-    playerTaskHandle = NULL;
+  // stop the task if still running
+  if (task_to_delete != NULL) {
+    vTaskDelete(task_to_delete);
   }
-  
+
   if (tx_chan) {
     i2s_del_channel(tx_chan);
     tx_chan = NULL;
   }
 
+  if (playerStateMux != NULL) {
+    vSemaphoreDelete(playerStateMux);
+    playerStateMux = NULL;
+  }
   if (snapcastSettingsMux != NULL) {
     vSemaphoreDelete(snapcastSettingsMux);
     snapcastSettingsMux = NULL;
@@ -431,7 +453,7 @@ int deinit_player(void) {
 
 
   tg0_timer_deinit();
-  
+
 #if CONFIG_PM_ENABLE
   if (player_pm_lock_handle) {
     esp_pm_lock_delete(player_pm_lock_handle);
@@ -447,8 +469,9 @@ int deinit_player(void) {
 /**
  *  call before http task creation!
  */
-int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_) {
+int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*set_mute_cb)(bool, bool)) {
   int ret = 0;
+  audio_set_mute = set_mute_cb;
 
   deinit_player();
 
@@ -461,12 +484,15 @@ int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_) {
   currentSnapcastSetting.sr = 0;
   currentSnapcastSetting.ch = 0;
   currentSnapcastSetting.bits = 0;
-  currentSnapcastSetting.muted = true;
-  currentSnapcastSetting.volume = 0;
 
   if (snapcastSettingsMux == NULL) {
     snapcastSettingsMux = xSemaphoreCreateMutex();
     xSemaphoreGive(snapcastSettingsMux);
+  }
+
+  if (playerStateMux == NULL) {
+    playerStateMux = xSemaphoreCreateMutex();
+    xSemaphoreGive(playerStateMux);
   }
 
   /**
@@ -518,24 +544,25 @@ int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_) {
  * call to start the player task
  */
 int start_player(snapcastSetting_t *setting) {
-    if (playerstarted){
-        return -1;
-    }
-    // Clear shutdown flag - we're starting a new session
-    player_shutdown_in_progress = false;
-    playerstarted = true;
-    if (network_playback_started() != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to signal playback started to network layer");
-    }
+  if (xSemaphoreTake(playerStateMux, 0) != pdTRUE) {
+    // shutdown in progress, don't start player
+    return -1;
+  }
+  if (playerStarted || playerPaused){
+      xSemaphoreGive(playerStateMux);
+      return -1;
+  }
+  playerStarted = true;
   int ret = 0;
 
   ret = player_setup_i2s(setting);
   if (ret < 0) {
     ESP_LOGE(TAG, "player_setup_i2s failed: %d", ret);
-    network_playback_stopped();
-    playerstarted = false;
+    playerStarted = false;
+    xSemaphoreGive(playerStateMux);
     return -1;
   }
+  xSemaphoreGive(playerStateMux);
 
   tg0_timer_init();
 
@@ -568,8 +595,8 @@ int start_player(snapcastSetting_t *setting) {
       esp_pm_lock_release(player_pm_lock_handle);
 #endif
       tg0_timer_deinit();
-      network_playback_stopped();
-      playerstarted = false;
+      playerStarted = false;
+      call_state_cb();
       return -1;
     }
 
@@ -591,10 +618,65 @@ int start_player(snapcastSetting_t *setting) {
                           SYNC_TASK_PRIORITY, &playerTaskHandle,
                           SYNC_TASK_CORE_ID);
 
-
+  call_state_cb();
   ESP_LOGI(TAG, "start player done");
 
   return 0;
+}
+
+void pause_player(bool pause) {
+  bool state_changed = false;
+  xSemaphoreTake(playerStateMux, portMAX_DELAY);
+  if (pause != playerPaused) {
+    playerPaused = pause;
+    state_changed = true;
+    if (pause && playerTaskHandle != NULL) {
+      xTaskNotifyGiveIndexed(playerTaskHandle, 1);
+    }
+  }
+  xSemaphoreGive(playerStateMux);
+
+  // Call callbacks OUTSIDE the mutex to avoid reentrancy deadlock
+  if (state_changed && !pause) {
+    call_state_cb();  // notify state change, e.g. for http task to send pcm
+  }
+}
+
+player_state_e get_player_state(void) {
+  xSemaphoreTake(playerStateMux, portMAX_DELAY);
+  player_state_e state = IDLE;
+  if (playerPaused) {
+    state = PAUSED;
+  } else if (playerStarted) {
+    state = PLAYING;
+  }
+  xSemaphoreGive(playerStateMux);
+  return state;
+}
+
+void call_state_cb(void) {
+  state_cb_t *current = state_cb_head;
+  while (current != NULL) {
+    if (current->cb != NULL) {
+      current->cb();
+    }
+    current = current->next;
+  }
+}
+
+/**
+ * add callback to be called when player state changes, e.g. from not started to started.
+ * Callbacks needs to be implemented thread safe as they will be called from player task
+ */
+void add_player_state_cb(void (*cb)()) {
+  state_cb_t *new_cb = malloc(sizeof(state_cb_t));
+  if (new_cb == NULL) {
+    ESP_LOGE(TAG, "Failed to allocate memory for state callback");
+    return;
+  }
+  new_cb->cb = cb;
+  new_cb->next = state_cb_head;
+  state_cb_head = new_cb;
 }
 
 /**
@@ -698,8 +780,7 @@ int32_t player_send_snapcast_setting(snapcastSetting_t *setting) {
   if ((curSet.bits != setting->bits) || (curSet.buf_ms != setting->buf_ms) ||
       (curSet.ch != setting->ch) ||
       (curSet.chkInFrames != setting->chkInFrames) ||
-      (curSet.codec != setting->codec) || (curSet.muted != setting->muted) ||
-      (curSet.sr != setting->sr) || (curSet.volume != setting->volume) ||
+      (curSet.codec != setting->codec) || (curSet.sr != setting->sr) ||
       (curSet.cDacLat_ms != setting->cDacLat_ms)) {
     ret = player_set_snapcast_settings(setting);
     if (ret != pdPASS) {
@@ -708,16 +789,7 @@ int32_t player_send_snapcast_setting(snapcastSetting_t *setting) {
                "snapcast setting");
     }
 
-    // check if it is only volume / mute related setting, which is handled by
-    // http_get_task()
-    // if ((((curSet.muted != setting->muted) ||
-          //(curSet.volume != setting->volume)) &&
-         //((curSet.bits == setting->bits) &&
-          //(curSet.buf_ms == setting->buf_ms) && (curSet.ch == setting->ch) &&
-          //(curSet.chkInFrames == setting->chkInFrames) &&
-          //(curSet.codec == setting->codec) && (curSet.sr == setting->sr) &&
-          //(curSet.cDacLat_ms == setting->cDacLat_ms))) == false) {
-      // notify needed
+    // notify needed
     if ((playerTaskHandle != NULL) && (snapcastSettingQueueHandle != NULL)) {
       ret = xQueueOverwrite(snapcastSettingQueueHandle, &settingChanged);
       if (ret != pdPASS) {
@@ -1371,21 +1443,18 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
     return -1;
   }
 
+  if (playerPaused) {
+    free_pcm_chunk(pcmChunk);
+    return 0;
+  }
   if (pcmChkQHdl == NULL) {
-    ESP_LOGW(TAG, "pcm chunk queue not created. Player started: %s", playerstarted ? "True": "False");
+    ESP_LOGW(TAG, "pcm chunk queue not created. Player started: %s", playerStarted ? "True": "False");
 
     free_pcm_chunk(pcmChunk);
 
-    // Don't try to restart player if shutdown is in progress (prevents race condition
-    // where we try to start player while it's still cleaning up)
-    if (player_shutdown_in_progress) {
-        ESP_LOGD(TAG, "Player shutdown in progress, not restarting");
-        return -2;
-    }
-
     snapcastSetting_t curSet;
     player_get_snapcast_settings(&curSet);
-    if (!curSet.muted && gotSettings) {
+    if (gotSettings) {
         start_player(&curSet);
     }
 
@@ -1481,7 +1550,7 @@ static void player_task(void *pvParameters) {
   
   //audio_hal_ctrl_codec(audio_hal_handle_t audio_hal, audio_hal_codec_mode_t mode, audio_hal_ctrl_t audio_hal_ctrl)
 
-  audio_set_mute(true);
+  audio_set_mute(true, false);
 
   buf_us = (int64_t)(scSet.buf_ms) * 1000LL;
   clientDacLatency_us = (int64_t)scSet.cDacLat_ms * 1000LL;
@@ -1507,7 +1576,7 @@ static void player_task(void *pvParameters) {
 //
 //    ESP_LOGI(TAG, "created new queue with %d", entries);
 //  }
-  audio_set_mute(scSet.muted);
+  audio_set_mute(false, false);
 
   // wait for early time syncs to be ready
   xSemaphoreTake(latencyBufFullSemaphoreHandle, portMAX_DELAY);
@@ -1542,7 +1611,7 @@ static void player_task(void *pvParameters) {
         if ((scSet.sr != __scSet.sr) || (scSet.bits != __scSet.bits) ||
             (scSet.ch != __scSet.ch)) {
           my_i2s_channel_enable(tx_chan);
-          audio_set_mute(true);
+          audio_set_mute(true, false);
           my_i2s_channel_disable(tx_chan);
 
           ret = player_setup_i2s(&__scSet);
@@ -1588,13 +1657,11 @@ static void player_task(void *pvParameters) {
             (scSet.ch != __scSet.ch) || (scSet.buf_ms != __scSet.buf_ms)) {
           ESP_LOGI(TAG,
                    "snapserver config changed, buffer %ldms, chunk %ld frames, "
-                   "sample rate %ld, ch %d, bits %d mute %d latency %ld",
+                   "sample rate %ld, ch %d, bits %d latency %ld",
                    __scSet.buf_ms, __scSet.chkInFrames, __scSet.sr, __scSet.ch,
-                   __scSet.bits, __scSet.muted, __scSet.cDacLat_ms);
-        } else {
-          audio_set_mute(__scSet.muted);
-          ESP_LOGI(TAG, "snapserver config changed, mute: %d", __scSet.muted);
+                   __scSet.bits, __scSet.cDacLat_ms);
         }
+        audio_set_mute(false, false);
 
         scSet = __scSet;  // store for next round
 
@@ -1726,8 +1793,6 @@ static void player_task(void *pvParameters) {
 
           my_gptimer_stop(gptimer);
           
-          audio_dac_enable(true);
-          
           my_i2s_channel_enable(tx_chan);
           
           playback_start_time_us = esp_timer_get_time();
@@ -1743,7 +1808,7 @@ static void player_task(void *pvParameters) {
 
           // TODO: use a timer to un-mute non blocking
           vTaskDelay(pdMS_TO_TICKS(2));
-          audio_set_mute(scSet.muted);
+          audio_set_mute(false, false);
 
           ESP_LOGI(TAG, "initial sync age: %lldus, chunk duration: %lldus", age,
                    chunkDuration_us);
@@ -1788,7 +1853,7 @@ static void player_task(void *pvParameters) {
 
           insertedSamplesCounter = 0;
 
-          audio_set_mute(true);
+          audio_set_mute(true, false);
 
           my_i2s_channel_disable(tx_chan);
 
@@ -2044,7 +2109,7 @@ static void player_task(void *pvParameters) {
 
             my_gptimer_stop(gptimer);
 
-            audio_set_mute(true);
+            audio_set_mute(true, false);
 
             my_i2s_channel_disable(tx_chan);
 
@@ -2134,21 +2199,23 @@ static void player_task(void *pvParameters) {
       dir = 0;
       initialSync = 0;
 
-      audio_set_mute(true);
-      audio_dac_enable(false);
+      audio_set_mute(true, false);
       my_i2s_channel_disable(tx_chan);
       i2s_del_channel(tx_chan);
       tx_chan = NULL;
 
       break;
     }
+    if (ulTaskNotifyTakeIndexed(1, pdTRUE, 0) == pdTRUE) {
+      audio_set_mute(true, false);
+      my_i2s_channel_disable(tx_chan);
+      i2s_del_channel(tx_chan);
+      tx_chan = NULL;
+      break;
+    }
   }
   ret = 0;
-
-  // Set shutdown flag BEFORE destroying resources to prevent insert_pcm_chunk
-  // from trying to restart the player during cleanup
-  player_shutdown_in_progress = true;
-
+  xSemaphoreTake(playerStateMux, portMAX_DELAY);
   xSemaphoreTake(snapcastSettingsMux, portMAX_DELAY);
   // delete the queue
   vQueueDelete(snapcastSettingQueueHandle);
@@ -2162,18 +2229,11 @@ static void player_task(void *pvParameters) {
   ret = destroy_pcm_queue(&pcmChkQHdl);
 
   tg0_timer_deinit();
-  playerstarted = false;
-  /* Notify network layer that playback stopped so pending Ethernet takeover
-   * can proceed if one was waiting.
-   */
-  if (network_playback_stopped() != ESP_OK) {
-      ESP_LOGW(TAG, "Failed to signal playback stopped to network layer");
-  }
+  playerStarted = false;
+  call_state_cb();
   ESP_LOGI(TAG, "stop player done");
 
-  // Cleanup complete - clear shutdown flag so player can restart
-  player_shutdown_in_progress = false;
-
   playerTaskHandle = NULL;
+  xSemaphoreGive(playerStateMux);
   vTaskDelete(NULL);
 }

@@ -62,15 +62,20 @@ typedef struct snapcastSetting_s {
   i2s_data_bit_width_t bits;
 
   bool muted;
-  uint32_t volume;
 
   char *pcmBuf;
   uint32_t pcmBufSize;
 } snapcastSetting_t;
 
-int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_);
+typedef enum { IDLE = 0, PLAYING, PAUSED } player_state_e;
+int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*set_mute_cb)(bool, bool));
 int deinit_player(void);
 int start_player(snapcastSetting_t *setting);
+void pause_player(bool pause);
+
+void call_state_cb(void);
+void add_player_state_cb(void (*cb)(void));
+player_state_e get_player_state(void);
 
 int32_t allocate_pcm_chunk_memory(pcm_chunk_message_t **pcmChunk, size_t bytes);
 int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk);
