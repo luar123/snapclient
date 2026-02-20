@@ -107,23 +107,11 @@ Update third party code (opus, flac, esp-dsp, improv_wifi):
 ```
 git submodule update --init
 ```
-Copy one of the template sdkconfig files and rename it to sdkconfig...
 
-...on Linux:
-```
-cp sdkconfig_lyrat_v4.3 sdkconfig
-```
-
-...on Windows:
-```
-copy sdkconfig_lyrat_v4.3 sdkconfig
-```
-
-### ESP-IDF environment setup (required for configuration, compiling and flashing)
+### ESP-IDF environnement configuration
 - <b>If you're on Windows :</b> Install [ESP-IDF v5.5.1](https://github.com/espressif/esp-idf/releases/tag/v5.5.1) locally ([More info](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/get-started/windows-setup-update.html)).
-- <b>If you're on Linux (docker) :</b> Use the image for ESP-IDF by following [docker build](doc/docker_build.md) doc (you won't need any of the remaining commands/steps below up until the <b>Test</b> section then) 
+- <b>If you're on Linux (docker) :</b> Use the image for ESP-IDF by following [docker build](doc/docker_build.md) doc
 - <b>If you're on Linux :</b> follow [official Espressif](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/linux-macos-setup.html) instructions
-
   For debian based systems you'll need to do the following:
   ```
   sudo apt-get install git wget flex bison gperf python3 python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0
@@ -135,16 +123,24 @@ copy sdkconfig_lyrat_v4.3 sdkconfig
   . ./export.sh
   ```
 
-### Snapcast ESP Configuration (Non-Docker-Linux and Windows)
+<a name="config"></a>
+### Snapcast ESP Configuration
+Start with the default config (remove any existing sdkconfig file) or copy one of the template sdkconfig files and rename it to sdkconfig
 
-Configure your platform:
+```
+rm sdkconfig
+```
+or
+```
+cp sdkconfig_lyrat_v4.3 sdkconfig
+```
+
+then configure your platform:
 
 ```
 idf.py menuconfig
 ```
-
-<a name="config"></a>
-Choose configuration options to match your setup
+Configure to match your setup
   - <b>Audio HAL :</b> Choose your audio board
     - Lyrat (4.3, 4.2)
     - Lyrat TD (2.2, 2.1)
@@ -228,7 +224,7 @@ Replace `snapclient.local` with your clients IP address. If you have multiple cl
 
 You are very welcome to help and provide [Pull
 Requests](https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests/about-pull-requests)
-to the project. Use [develop](https://github.com/CarlosDerSeher/snapclient/tree/develop) branch for your PRs as this is the place where new features will go.
+to the project.
 
 We strongly suggest you activate [pre-commit](https://pre-commit.com) hooks in
 this git repository before starting to hack and make commits.
