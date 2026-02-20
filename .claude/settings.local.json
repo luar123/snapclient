@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "WebFetch(domain:github.com)",
-      "Bash(MSYS_NO_PATHCONV=1 docker run:*)"
-    ]
-  }
-}
