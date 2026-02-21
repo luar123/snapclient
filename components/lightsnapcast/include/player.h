@@ -68,7 +68,7 @@ typedef struct snapcastSetting_s {
 } snapcastSetting_t;
 
 typedef enum { IDLE = 0, PLAYING, PAUSED } player_state_e;
-int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*set_mute_cb)(bool, bool));
+int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*set_mute_cb)(bool));
 int deinit_player(void);
 int start_player(snapcastSetting_t *setting);
 void pause_player(bool pause);

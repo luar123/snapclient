@@ -118,7 +118,7 @@ static audioDACdata_t audioDAC_data;
 static QueueHandle_t audioDACQHdl = NULL;
 static SemaphoreHandle_t audioDACSemaphore = NULL;
 static void (*set_volume_cb)(int volume);
-static void (*set_mute_cb)(bool mute, bool set_state);
+static void (*set_mute_cb)(bool mute);
 
 void time_sync_msg_cb(void *args);
 
@@ -503,9 +503,21 @@ void error_callback(const FLAC__StreamDecoder *decoder,
 /**
  *
  */
-void init_snapcast(void (*set_volume)(int), void (*set_mute)(bool, bool)) {
+int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool)) {
+  if (set_volume == NULL) {
+    ESP_LOGE(TAG, "Volume callback is NULL");
+
+    return -1;
+  }
+  if (set_mute == NULL) {
+    ESP_LOGE(TAG, "Mute callback is NULL");
+
+    return -1;
+  }
   set_volume_cb = set_volume;
   set_mute_cb = set_mute;
+
+  return 0;
 }
 
 
@@ -533,7 +545,7 @@ int server_settings_msg_received(
       dsp_processor_set_volome((double)server_settings_message->volume / 100);
     }
 #endif
-    set_mute_cb(server_settings_message->muted, true);
+    set_mute_cb(server_settings_message->muted);
   }
 
   if (volume != server_settings_message->volume) {
@@ -1381,6 +1393,7 @@ static void dac_control(audio_board_handle_t board_handle,
   // audio_board_handle_t?
   if (dac_data.playerMute != dac_data_old.playerMute ||
       dac_data.stateMute != dac_data_old.stateMute) {
+    // if either player or state mute is active, we need to mute the output
     bool mute = dac_data.playerMute || dac_data.stateMute;
     if (mute != muted) {
       muted = mute;
@@ -1394,7 +1407,8 @@ static void dac_control(audio_board_handle_t board_handle,
 }
 
 /**
- *
+ * Set mute state. If set_state is true, it reflects the snapclient state. Otherwise it
+ * is coming from player for temporary muting e.g. during startup.
  */
 void audio_set_mute(bool mute, bool set_state) {
   xSemaphoreTake(audioDACSemaphore, portMAX_DELAY);
@@ -1402,11 +1416,19 @@ void audio_set_mute(bool mute, bool set_state) {
     audioDAC_data.stateMute = mute;
     xQueueOverwrite(audioDACQHdl, &audioDAC_data);
   }
-  if (!set_state && mute != audioDAC_data.playerMute) {
+  else if (!set_state && mute != audioDAC_data.playerMute) {
     audioDAC_data.playerMute = mute;
     xQueueOverwrite(audioDACQHdl, &audioDAC_data);
   }
   xSemaphoreGive(audioDACSemaphore);
+}
+
+void player_set_mute(bool mute) {
+  audio_set_mute(mute, false);
+}
+
+void set_mute_state(bool mute) {
+  audio_set_mute(mute, true);
 }
 
 /**
@@ -1594,8 +1616,8 @@ void app_main(void) {
   audioDAC_data.playerMute = true;
   audioDAC_data.volume = -1;
 
-  init_snapcast(audio_set_volume, audio_set_mute);
-  init_player(i2s_pin_config0, I2S_NUM_0, audio_set_mute);
+  init_snapcast(audio_set_volume, set_mute_state);
+  init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute);
   add_player_state_cb(player_state_changed);
 
   // Create binary semaphore for player state change notification
