@@ -15,12 +15,14 @@
 #include <string.h>
 
 #include "esp_event.h"
+#include "esp_eth.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_wifi_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
@@ -30,8 +32,14 @@
 #endif
 
 #include "wifi_interface.h"
+#include "../lightsnapcast/include/player.h"
 
 static const char *TAG = "NET_IF";
+
+/* ============ Shared MAC Address for WiFi and Ethernet ============ */
+static uint8_t unified_mac_address[ETH_ADDR_LEN] = {0};
+static bool unified_mac_initialized = false;
+static SemaphoreHandle_t mac_mutex = NULL;
 
 /* ============ Event Group for Inter-Component Coordination ============ */
 #define EVENT_RECONNECT_REQUESTED_BIT  BIT0
@@ -115,11 +123,18 @@ esp_err_t network_playback_stopped(void) {
 }
 
 bool network_is_playback_active(void) {
-    if (!network_event_group) {
-        return false;
+    // Primary check: Event bits (fast path, set by Layer 1 synchronously)
+    if (network_event_group) {
+        EventBits_t bits = xEventGroupGetBits(network_event_group);
+        if (bits & EVENT_PLAYBACK_STARTED_BIT) {
+            return true;
+        }
     }
-    EventBits_t bits = xEventGroupGetBits(network_event_group);
-    return (bits & EVENT_PLAYBACK_STARTED_BIT) != 0;
+
+    // Fallback: Direct player state check (catches edge cases)
+    // This protects against race conditions if event bit isn't set yet
+    player_state_e state = get_player_state();
+    return (state == PLAYING);
 }
 
 /* types of ipv6 addresses to be displayed on ipv6 events */
@@ -185,6 +200,58 @@ bool network_has_ip(esp_netif_t *esp_netif) {
 #endif
 }
 
+/**
+ * @brief Get the unified MAC address for all network interfaces (thread-safe)
+ *
+ * Reads WiFi's MAC address from eFuse on first call and caches it.
+ * All network interfaces (WiFi and Ethernet) should use this MAC.
+ *
+ * Thread Safety: Uses mutex to protect initialization and read operations.
+ * Safe to call from multiple threads concurrently.
+ *
+ * @param[out] mac_out Buffer to receive ETH_ADDR_LEN-byte MAC address. Must not be NULL.
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if mac_out is NULL,
+ *         ESP_ERR_NO_MEM if mutex creation fails
+ */
+esp_err_t network_get_unified_mac_internal(uint8_t *mac_out) {
+    if (!mac_out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Create mutex on first use (happens once during early boot before multithreading)
+    if (!mac_mutex) {
+        mac_mutex = xSemaphoreCreateMutex();
+        if (!mac_mutex) {
+            ESP_LOGE(TAG, "Failed to create MAC mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    // Acquire mutex for thread-safe access
+    xSemaphoreTake(mac_mutex, portMAX_DELAY);
+
+    if (!unified_mac_initialized) {
+        esp_err_t err = esp_read_mac(unified_mac_address, ESP_MAC_WIFI_STA);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to read WiFi MAC address: %s", esp_err_to_name(err));
+            xSemaphoreGive(mac_mutex);
+            return err;
+        }
+
+        ESP_LOGI(TAG, "Unified MAC address: %02X:%02X:%02X:%02X:%02X:%02X",
+                 unified_mac_address[0], unified_mac_address[1],
+                 unified_mac_address[2], unified_mac_address[3],
+                 unified_mac_address[4], unified_mac_address[5]);
+
+        unified_mac_initialized = true;
+    }
+
+    memcpy(mac_out, unified_mac_address, ETH_ADDR_LEN);
+
+    xSemaphoreGive(mac_mutex);
+    return ESP_OK;
+}
+
 bool network_if_get_ip(esp_netif_ip_info_t *ip) {
 #if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
     CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
@@ -203,6 +270,14 @@ bool network_if_get_ip(esp_netif_ip_info_t *ip) {
 void network_if_init(void) {
   esp_netif_init();
   ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+  // Initialize unified MAC address before starting any network interfaces
+  uint8_t mac[ETH_ADDR_LEN];
+  esp_err_t err = network_get_unified_mac_internal(mac);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "CRITICAL: Failed to initialize unified MAC address");
+    ESP_ERROR_CHECK(err);  // Fatal error - cannot proceed without MAC
+  }
 
 #if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
     CONFIG_SNAPCLIENT_USE_SPI_ETHERNET

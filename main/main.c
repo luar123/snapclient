@@ -1139,9 +1139,11 @@ void before_receive_callback(before_receive_callback_data_t *data) {
 
 void network_playback_state_changed() {
   player_state_e state = get_player_state();
-  if (state == PLAYING) {
+  if (state == PLAYING || state == PAUSED) {
+    // Both PLAYING and PAUSED are active sessions - keep network up
     network_playback_started();
   } else {
+    // Only IDLE state means playback truly stopped
     network_playback_stopped();
   }
 }
@@ -1220,6 +1222,13 @@ static void http_get_task(void *pvParameters) {
       }
     }
 
+    // If a reconnect was requested but the inner loop exited via TCP error
+    // (-2) instead, the server still needs time to tear down the old session.
+    if (network_check_and_clear_reconnect()) {
+      ESP_LOGD(TAG, "Pending reconnect; waiting 2s for server cleanup");
+      vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
     // NETWORK setup ends here ( or before getting mac address )
     setup_network(&connection.netif);
 
@@ -1232,10 +1241,16 @@ static void http_get_task(void *pvParameters) {
     uint8_t base_mac[6];
 #if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
     CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
-    // Get MAC address for Eth Interface
+    // Get runtime MAC address for Eth Interface (reflects unified MAC if applied)
     char eth_mac_address[18];
-
-    esp_read_mac(base_mac, ESP_MAC_ETH);
+    {
+      esp_netif_t *eth_nif = network_get_netif_from_desc(NETWORK_INTERFACE_DESC_ETH);
+      if (eth_nif && esp_netif_get_mac(eth_nif, base_mac) == ESP_OK) {
+        // Use runtime MAC from netif (matches what's on the wire)
+      } else {
+        esp_read_mac(base_mac, ESP_MAC_ETH);  // fallback to eFuse
+      }
+    }
     sprintf(eth_mac_address, "%02X:%02X:%02X:%02X:%02X:%02X", base_mac[0],
             base_mac[1], base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
     ESP_LOGI(TAG, "eth mac: %s", eth_mac_address);
@@ -1347,17 +1362,23 @@ static void http_get_task(void *pvParameters) {
     netconn_set_recvtimeout(lwipNetconn, time_sync_data.timeout / 1000); // timeout in ms
 
 
+    // Drain any reconnect request that arrived while we were connecting
+    // (e.g., boot-time MAC unification fires reconnect during mDNS/TCP setup).
+    // No delay needed: no prior server session exists to clean up.
+    network_check_and_clear_reconnect();
+
     // Main connection loop - state machine + data processing
     bool paused = false;
     while (1) {
       // Check if external module requested reconnect (e.g., ethernet takeover)
       if (network_check_and_clear_reconnect()) {
-        ESP_LOGI(TAG, "Reconnect requested during receive loop, breaking out");
-        // Give server time to detect disconnect and clean up old socket state
-        // before we reconnect (helps with servers that don't handle quick
-        // reconnects from the same client ID on a different interface)
-        ESP_LOGI(TAG, "Waiting 2s for server to clean up old connection...");
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        ESP_LOGI(TAG, "Reconnect requested, closing connection");
+        if (lwipNetconn != NULL) {
+          netconn_close(lwipNetconn);
+          netconn_delete(lwipNetconn);
+          lwipNetconn = NULL;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));  // let server clean up
         break;
       }
 

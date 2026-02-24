@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -46,6 +47,7 @@ static const char *TAG = "ETH_IF";
 #define ETH_GATEWAY_CHECK_TIMEOUT_MS  5000  // Overall timeout for gateway reachability check
 #define ETH_STATIC_IP_TASK_STACK      4096  // Stack size for static IP background task
 #define ETH_STATIC_IP_TASK_PRIORITY   5     // Priority for static IP background task
+#define ETH_TAKEOVER_MIN_GRACE_MS     500   // Minimum delay before takeover (prevents immediate switch during race condition window)
 
 /* ============ State Variables ============ */
 static uint8_t eth_port_cnt = 0;
@@ -61,9 +63,12 @@ static SemaphoreHandle_t connIpSemaphoreHandle = NULL;
  *   if we never completed takeover).
  * - we_changed_default_netif: Set after successfully changing default netif to
  *   Ethernet. Used to trigger WiFi fallback on disconnect.
+ * - eth_got_ip_time: Timestamp when Ethernet acquired IP, used to enforce
+ *   grace period before performing takeover (allows active playback to adapt)
  */
 static bool we_changed_default_netif = false;
 static bool want_eth_takeover = false;
+static int64_t eth_got_ip_time = 0;
 
 /* Ethernet mode: 0=Disabled, 1=DHCP (default), 2=Static */
 static int32_t current_eth_mode = 0;
@@ -85,9 +90,23 @@ static bool static_ip_pending = false;
 static esp_netif_t *static_ip_netif = NULL;
 static TaskHandle_t static_ip_task_handle = NULL;
 
+/*
+ * MAC Unification Deferral:
+ * When Ethernet connects during active playback, we let Ethernet keep its
+ * default (different) MAC so the switch doesn't learn our WiFi MAC on the
+ * Ethernet port. Only after playback stops do we set the unified MAC and
+ * restart DHCP to get the same IP as WiFi for seamless takeover.
+ */
+static bool mac_unification_pending = false;
+static esp_netif_t *mac_unification_netif = NULL;
+
+/* Saved eth_handles pointer for deferred MAC unification */
+static esp_eth_handle_t *s_eth_handles = NULL;
+
+
 /* Playback monitor task - watches for playback stopped events */
 static TaskHandle_t playback_monitor_task_handle = NULL;
-#define PLAYBACK_MONITOR_TASK_STACK   2048
+#define PLAYBACK_MONITOR_TASK_STACK   4096
 #define PLAYBACK_MONITOR_TASK_PRIORITY 4
 
 /* Forward declaration for playback stopped handler */
@@ -129,7 +148,7 @@ static void playback_monitor_task(void *pvParameters) {
             break;
         }
 
-        ESP_LOGD(TAG, "Playback monitor: playback started, waiting for stop...");
+        ESP_LOGI(TAG, "Playback monitor: playback started, waiting for stop...");
 
         // Wait for playback to stop OR shutdown signal
         bits = xEventGroupWaitBits(event_group,
@@ -143,7 +162,26 @@ static void playback_monitor_task(void *pvParameters) {
             break;
         }
 
-        ESP_LOGD(TAG, "Playback monitor: playback stopped, processing pending operations...");
+        ESP_LOGI(TAG, "Playback monitor: playback stopped, waiting grace period...");
+
+        // Grace period: wait 2s to see if playback restarts (e.g. during RESYNCING HARD)
+        bits = xEventGroupWaitBits(event_group,
+                           PLAYBACK_STARTED_BIT | EVENT_MONITOR_SHUTDOWN_BIT,
+                           pdFALSE,  // Don't clear on exit
+                           pdFALSE,  // Don't wait for all bits
+                           pdMS_TO_TICKS(2000));
+
+        if (bits & EVENT_MONITOR_SHUTDOWN_BIT) {
+            ESP_LOGI(TAG, "Playback monitor: shutdown requested during grace period");
+            break;
+        }
+
+        if (bits & PLAYBACK_STARTED_BIT) {
+            ESP_LOGI(TAG, "Playback monitor: playback restarted during grace period, skipping");
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Playback monitor: grace period expired, processing pending ops");
 
         // Process any pending operations (deferred takeover or static IP)
         eth_on_playback_stopped();
@@ -284,6 +322,9 @@ static esp_eth_handle_t eth_init_internal(esp_eth_mac_t **mac_out,
   esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
   ESP_GOTO_ON_FALSE(esp_eth_driver_install(&config, &eth_handle) == ESP_OK,
                     NULL, err, TAG, "Ethernet driver install failed");
+
+  // MAC is NOT set here - Ethernet uses its default (eFuse) MAC at init time.
+  // Unified MAC is applied later via eth_apply_unified_mac() when safe to do so.
 
   if (mac_out != NULL) {
     *mac_out = mac;
@@ -472,23 +513,27 @@ static esp_err_t eth_init(esp_eth_handle_t *eth_handles_out[],
   spi_eth_module_config_t
       spi_eth_module_config[CONFIG_SNAPCLIENT_SPI_ETHERNETS_NUM] = {0};
   INIT_SPI_ETH_MODULE_CONFIG(spi_eth_module_config, 0);
-  // The SPI Ethernet module(s) might not have a burned factory MAC address,
-  // hence use manually configured address(es). In this example, Locally
-  // Administered MAC address derived from ESP32x base MAC address is used. Note
-  // that Locally Administered OUI range should be used only when testing on a
-  // LAN under your control!
-  uint8_t base_mac_addr[ETH_ADDR_LEN];
-  ESP_GOTO_ON_ERROR(esp_efuse_mac_get_default(base_mac_addr), err, TAG,
-                    "get EFUSE MAC failed");
-  uint8_t local_mac_1[ETH_ADDR_LEN];
-  esp_derive_local_mac(local_mac_1, base_mac_addr);
-  spi_eth_module_config[0].mac_addr = local_mac_1;
+
+  // SPI Ethernet chips (W5500, etc.) have no factory MAC - they need one assigned.
+  // Use the ESP32's Ethernet eFuse MAC as a temporary MAC (different from WiFi MAC).
+  // The unified WiFi MAC is applied later via eth_apply_unified_mac() when safe.
+  static uint8_t spi_temp_mac[CONFIG_SNAPCLIENT_SPI_ETHERNETS_NUM][ETH_ADDR_LEN];
+  esp_err_t mac_err = esp_read_mac(spi_temp_mac[0], ESP_MAC_ETH);
+  if (mac_err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read Ethernet base MAC: %s", esp_err_to_name(mac_err));
+    ESP_GOTO_ON_ERROR(mac_err, err, TAG, "Cannot proceed without MAC address");
+  }
+  spi_eth_module_config[0].mac_addr = spi_temp_mac[0];
+  ESP_LOGI(TAG, "SPI Ethernet #0 temporary MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+           spi_temp_mac[0][0], spi_temp_mac[0][1], spi_temp_mac[0][2],
+           spi_temp_mac[0][3], spi_temp_mac[0][4], spi_temp_mac[0][5]);
+
 #if CONFIG_SNAPCLIENT_SPI_ETHERNETS_NUM > 1
   INIT_SPI_ETH_MODULE_CONFIG(spi_eth_module_config, 1);
-  uint8_t local_mac_2[ETH_ADDR_LEN];
-  base_mac_addr[ETH_ADDR_LEN - 1] += 1;
-  esp_derive_local_mac(local_mac_2, base_mac_addr);
-  spi_eth_module_config[1].mac_addr = local_mac_2;
+  // Derive second SPI MAC by incrementing the base
+  memcpy(spi_temp_mac[1], spi_temp_mac[0], ETH_ADDR_LEN);
+  spi_temp_mac[1][ETH_ADDR_LEN - 1]++;
+  spi_eth_module_config[1].mac_addr = spi_temp_mac[1];
 #endif
 #if CONFIG_SNAPCLIENT_SPI_ETHERNETS_NUM > 2
 #error Maximum number of supported SPI Ethernet devices is currently limited to 2 by this example.
@@ -713,40 +758,122 @@ static esp_err_t eth_apply_static_ip(esp_netif_t *netif) {
 }
 
 /**
+ * @brief Apply unified (WiFi) MAC address to all Ethernet handles and netif
+ *
+ * Sets the MAC address at both the driver level (hardware) and the netif level
+ * (lwIP stack) to match WiFi, enabling seamless IP takeover via DHCP.
+ * Both layers must be updated so DHCP packets have consistent MAC in the
+ * Ethernet frame and the chaddr/client-id fields.
+ *
+ * @param netif The Ethernet netif to update (NULL to skip netif update)
+ * @return ESP_OK on success, error code on failure
+ */
+static esp_err_t eth_apply_unified_mac(esp_netif_t *netif) {
+  if (!s_eth_handles) return ESP_ERR_INVALID_STATE;
+
+  uint8_t wifi_mac[ETH_ADDR_LEN];
+  esp_err_t err = network_get_unified_mac_internal(wifi_mac);
+  if (err != ESP_OK) return err;
+
+  for (int i = 0; i < eth_port_cnt; i++) {
+    if (s_eth_handles[i]) {
+      err = esp_eth_ioctl(s_eth_handles[i], ETH_CMD_S_MAC_ADDR, wifi_mac);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set unified MAC on eth%d: %s",
+                 i, esp_err_to_name(err));
+        return err;
+      }
+    }
+  }
+
+  // Update the netif MAC so lwIP/DHCP uses the new address in packets
+  if (netif) {
+    err = esp_netif_set_mac(netif, wifi_mac);
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "Failed to set netif MAC: %s", esp_err_to_name(err));
+    }
+  }
+
+  ESP_LOGI(TAG, "Unified MAC applied: %02X:%02X:%02X:%02X:%02X:%02X",
+           wifi_mac[0], wifi_mac[1], wifi_mac[2],
+           wifi_mac[3], wifi_mac[4], wifi_mac[5]);
+  return ESP_OK;
+}
+
+/**
  * @brief Unified takeover checkpoint - called from all IP acquisition paths
  *
  * Checks if conditions are met for Ethernet takeover and performs it atomically.
  * This ensures consistent behavior whether IP was acquired via DHCP or static config.
  *
+ * Enforces a grace period after Ethernet IP acquisition to allow active playback
+ * to adapt to the network change, preventing audio glitches from premature switching.
+ *
  * @param netif The Ethernet network interface that now has an IP
  */
 static void eth_check_and_apply_takeover(esp_netif_t *netif) {
   bool do_takeover = false;
+  bool do_mac_unify = false;
 
   xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-  if (want_eth_takeover && !we_changed_default_netif && !network_is_playback_active()) {
+
+  if (want_eth_takeover && !we_changed_default_netif &&
+      !network_is_playback_active()) {
     do_takeover = true;
+    do_mac_unify = mac_unification_pending;
     want_eth_takeover = false;
-    // Don't set we_changed_default_netif until after successful netif change
   }
   xSemaphoreGive(connIpSemaphoreHandle);
 
   if (do_takeover) {
     ESP_LOGI(TAG, "Ethernet takeover: setting default netif to ETH");
     esp_err_t err = esp_netif_set_default_netif(netif);
-    if (err == ESP_OK) {
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to set default netif: %s", esp_err_to_name(err));
+      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+      want_eth_takeover = true;
+      xSemaphoreGive(connIpSemaphoreHandle);
+      return;
+    }
+
+    if (do_mac_unify) {
+      // Suppress WiFi before applying unified MAC to prevent MAC flapping
+      wifi_suppress_for_takeover();
+      esp_wifi_disconnect();
+      vTaskDelay(pdMS_TO_TICKS(100));
+
+      err = eth_apply_unified_mac(netif);
+      if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to apply unified MAC: %s, restoring WiFi",
+                 esp_err_to_name(err));
+        wifi_clear_suppression(true);
+        xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+        want_eth_takeover = true;
+        xSemaphoreGive(connIpSemaphoreHandle);
+        return;
+      }
+
+      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+      we_changed_default_netif = true;
+      mac_unification_pending = false;
+      mac_unification_netif = NULL;
+      xSemaphoreGive(connIpSemaphoreHandle);
+
+      // Restart DHCP to obtain IP with unified MAC
+      esp_netif_dhcpc_stop(netif);
+      esp_netif_dhcpc_start(netif);
+
+      if (network_request_reconnect() != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to request reconnect after takeover");
+      }
+    } else {
+      // No MAC unification needed - just complete takeover
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
       we_changed_default_netif = true;
       xSemaphoreGive(connIpSemaphoreHandle);
       if (network_request_reconnect() != ESP_OK) {
         ESP_LOGW(TAG, "Failed to request reconnect after takeover");
       }
-    } else {
-      ESP_LOGE(TAG, "Failed to set default netif: %s", esp_err_to_name(err));
-      // Restore takeover intent so it can be retried
-      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-      want_eth_takeover = true;
-      xSemaphoreGive(connIpSemaphoreHandle);
     }
   } else if (want_eth_takeover && network_is_playback_active()) {
     ESP_LOGI(TAG, "Playback active; deferring Ethernet takeover until playback stops");
@@ -868,7 +995,7 @@ static void static_ip_task(void *pvParameters) {
 /** Event handler for Ethernet events */
 static void eth_event_handler(void *arg, esp_event_base_t event_base,
                               int32_t event_id, void *event_data) {
-  uint8_t mac_addr[6] = {0};
+  uint8_t mac_addr[ETH_ADDR_LEN] = {0};
   /* we can get the ethernet driver handle from event data */
   esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
   esp_netif_t *netif = (esp_netif_t *)arg;
@@ -881,25 +1008,37 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
                mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4],
                mac_addr[5]);
 
-      esp_err_t ipv6_err = esp_netif_create_ip6_linklocal(netif);
-      if (ipv6_err != ESP_OK) {
-        // ESP_ERR_ESP_NETIF_IF_NOT_READY is expected during link negotiation
-        if (ipv6_err == ESP_ERR_ESP_NETIF_IF_NOT_READY) {
-          ESP_LOGD(TAG, "IPv6 link-local: interface not ready yet (normal during link-up)");
+      // Check if MAC is already unified or will be deferred
+      uint8_t expected_mac[ETH_ADDR_LEN];
+      if (network_get_unified_mac_internal(expected_mac) == ESP_OK) {
+        if (memcmp(mac_addr, expected_mac, ETH_ADDR_LEN) == 0) {
+          ESP_LOGI(TAG, "Ethernet MAC matches WiFi MAC (unified)");
         } else {
-          ESP_LOGW(TAG, "Failed to create IPv6 link-local: %s (continuing)", esp_err_to_name(ipv6_err));
+          ESP_LOGI(TAG, "Ethernet using default MAC (will unify when ready)");
         }
       }
 
-      // Check if WiFi is currently up - if so, plan to prefer Ethernet once
-      // Ethernet has acquired an IP (after DHCP or static IP is applied).
-      esp_netif_t *sta_netif = network_get_netif_from_desc(NETWORK_INTERFACE_DESC_STA);
-      if (sta_netif && network_has_ip(sta_netif)) {
-        xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-        want_eth_takeover = true;
-        xSemaphoreGive(connIpSemaphoreHandle);
-        ESP_LOGI(TAG, "Ethernet present and WiFi active; will prefer Ethernet after IP acquired");
+      // Create IPv6 link-local address unconditionally.
+      // With deferred MAC unification, Ethernet uses its own default MAC during
+      // playback, so NDP traffic won't affect the switch's WiFi forwarding.
+      {
+        esp_err_t ipv6_err = esp_netif_create_ip6_linklocal(netif);
+        if (ipv6_err != ESP_OK) {
+          if (ipv6_err == ESP_ERR_ESP_NETIF_IF_NOT_READY) {
+            ESP_LOGD(TAG, "IPv6 link-local: interface not ready yet (normal during link-up)");
+          } else {
+            ESP_LOGW(TAG, "Failed to create IPv6 link-local: %s (continuing)", esp_err_to_name(ipv6_err));
+          }
+        }
       }
+
+      // Plan to prefer Ethernet and unify MAC once Ethernet has acquired
+      // an IP (after DHCP or static IP is applied). Set unconditionally
+      // so MAC unification happens even when ETH links up before WiFi.
+      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+      want_eth_takeover = true;
+      xSemaphoreGive(connIpSemaphoreHandle);
+      ESP_LOGI(TAG, "Ethernet present; will unify MAC after IP acquired");
 
       // Handle static IP mode (spawn task instead of blocking)
       if (current_eth_mode == 2) {  // Static
@@ -912,9 +1051,14 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
           static_ip_task_handle = NULL;
         }
 
-        // Check if playback is active - defer if so
+        // Always defer MAC unification to avoid switch MAC flapping
+        // when both WiFi and Ethernet are up simultaneously
+        mac_unification_pending = true;
+        mac_unification_netif = netif;
+
+        // Check if playback is active - defer static IP too
         if (network_is_playback_active()) {
-          ESP_LOGI(TAG, "Playback active; deferring static IP until playback stops");
+          ESP_LOGI(TAG, "Playback active; deferring static IP and MAC unification until playback stops");
           static_ip_pending = true;
           static_ip_netif = netif;
           static_ip_in_progress = false;
@@ -952,18 +1096,15 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
           }
         }
       } else if (current_eth_mode == 1) {
-        // DHCP mode: explicitly start DHCP client
-        // This is required because we stop DHCP on disconnect, and it doesn't
-        // automatically restart on reconnect - causing "invalid static ip" errors
-        esp_err_t dhcp_err = esp_netif_dhcpc_start(netif);
-        if (dhcp_err == ESP_OK) {
-          ESP_LOGI(TAG, "DHCP client started");
-        } else if (dhcp_err == ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
-          ESP_LOGD(TAG, "DHCP client already running");
-        } else {
-          ESP_LOGE(TAG, "Failed to start DHCP client: %s", esp_err_to_name(dhcp_err));
-        }
-        // Takeover will be handled in got_ip_event_handler when DHCP completes
+        // DHCP mode: always defer MAC unification. Applying the unified MAC
+        // while WiFi is also active causes MAC flapping on the switch (same
+        // MAC seen on two ports), leading to packet loss and TCP resets.
+        // MAC will be unified during takeover when traffic shifts to Ethernet.
+        xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+        mac_unification_pending = true;
+        mac_unification_netif = netif;
+        xSemaphoreGive(connIpSemaphoreHandle);
+        ESP_LOGI(TAG, "DHCP mode: MAC unification deferred until takeover...");
       }
 
       break;
@@ -988,6 +1129,23 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
       static_ip_pending = false;
       static_ip_netif = NULL;
 
+      // Reset MAC unification state on disconnect
+      mac_unification_pending = false;
+      mac_unification_netif = NULL;
+
+      // Revert Ethernet to temp MAC so next Link Up doesn't have the same
+      // MAC as WiFi (which causes switch MAC flapping on both ports)
+      {
+        uint8_t temp_mac[ETH_ADDR_LEN];
+        if (esp_read_mac(temp_mac, ESP_MAC_ETH) == ESP_OK) {
+          esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, temp_mac);
+          esp_netif_set_mac(netif, temp_mac);
+          ESP_LOGD(TAG, "Reverted to temp MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                   temp_mac[0], temp_mac[1], temp_mac[2],
+                   temp_mac[3], temp_mac[4], temp_mac[5]);
+        }
+      }
+
       // Stop any running DHCP client to avoid confusion
       esp_err_t dhcp_err = esp_netif_dhcpc_stop(netif);
       if (dhcp_err != ESP_OK && dhcp_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
@@ -1001,7 +1159,19 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Ethernet disconnected; triggering WiFi fallback");
         we_changed_default_netif = false;
         want_eth_takeover = false;  // Clear intent - we completed takeover and now falling back
+        eth_got_ip_time = 0;        // Reset grace period timer
         xSemaphoreGive(connIpSemaphoreHandle);
+
+        // Re-enable WiFi if it was suppressed during takeover
+        if (wifi_is_suppressed()) {
+          wifi_clear_suppression(true);
+        }
+
+        // Reset default netif to WiFi so setup_network() uses it
+        esp_netif_t *sta_netif = network_get_netif_from_desc(NETWORK_INTERFACE_DESC_STA);
+        if (sta_netif) {
+          esp_netif_set_default_netif(sta_netif);
+        }
         /* Request reconnect so main re-evaluates network and uses WiFi */
         if (network_request_reconnect() != ESP_OK) {
           ESP_LOGW(TAG, "Failed to request reconnect for WiFi fallback");
@@ -1012,6 +1182,7 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
          * actually completed takeover (handled above).
          */
         ESP_LOGD(TAG, "Ethernet disconnected before takeover completed, preserving intent");
+        eth_got_ip_time = 0;        // Reset grace period timer
         xSemaphoreGive(connIpSemaphoreHandle);
       }
 
@@ -1063,6 +1234,9 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
     if (network_is_our_netif(if_desc_str, event->esp_netif)) {
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
 
+      // Record timestamp when Ethernet got IP for grace period enforcement
+      eth_got_ip_time = esp_timer_get_time();
+
       memcpy((void *)&ip_info, (const void *)&event->ip_info,
              sizeof(esp_netif_ip_info_t));
       connected = true;
@@ -1106,6 +1280,29 @@ bool eth_get_ip(esp_netif_ip_info_t *ip) {
 }
 
 /**
+ * @brief Check if Ethernet takeover is pending (linked up, waiting for IP)
+ *
+ * Used by connection_handler to avoid committing to WiFi when Ethernet
+ * is about to acquire an IP and take over as the preferred interface.
+ */
+bool eth_is_takeover_pending(void) {
+  xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+  bool pending = want_eth_takeover && !we_changed_default_netif;
+  xSemaphoreGive(connIpSemaphoreHandle);
+  return pending;
+}
+
+/**
+ * @brief Check if Ethernet is enabled in configuration
+ *
+ * Used by connection_handler to decide whether to wait briefly for
+ * Ethernet link-up before committing to WiFi at boot.
+ */
+bool eth_is_enabled(void) {
+  return current_eth_mode != 0;
+}
+
+/**
  * @brief Handle playback stopped event
  *
  * Called by playback_monitor_task when playback stops. Completes any pending
@@ -1121,11 +1318,20 @@ static void eth_on_playback_stopped(void) {
 
   bool do_takeover = false;
   bool do_static_ip = false;
+  bool do_mac_unify = false;
   esp_netif_t *pending_netif = NULL;
 
   xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
 
-  // Check for pending static IP configuration first (takes priority over takeover)
+  // Check for pending MAC unification (always process first)
+  if (mac_unification_pending && mac_unification_netif) {
+    do_mac_unify = true;
+    pending_netif = mac_unification_netif;
+    mac_unification_pending = false;
+    mac_unification_netif = NULL;
+  }
+
+  // Check for pending static IP configuration (takes priority over takeover)
   if (static_ip_pending && static_ip_netif && !static_ip_in_progress) {
     do_static_ip = true;
     pending_netif = static_ip_netif;
@@ -1133,12 +1339,85 @@ static void eth_on_playback_stopped(void) {
     static_ip_in_progress = true;
   }
   // Check for pending takeover (DHCP path or already-configured static IP)
-  else if (want_eth_takeover && connected && !we_changed_default_netif) {
+  // ✓ Re-verify playback is not active - protects against playback resuming between
+  //   the time the STOPPED event was set and this function executes
+  else if (want_eth_takeover && connected && !we_changed_default_netif &&
+           !network_is_playback_active()) {
     do_takeover = true;
     want_eth_takeover = false;
   }
 
   xSemaphoreGive(connIpSemaphoreHandle);
+
+  ESP_LOGI(TAG, "eth_on_playback_stopped: mac_unify=%d static_ip=%d takeover=%d",
+           do_mac_unify, do_static_ip, do_takeover);
+
+  // Handle pending MAC unification (deferred during playback)
+  if (do_mac_unify) {
+    // Clear takeover flag — we're handling the transition via mac_unify path.
+    // Without this, eth_is_takeover_pending() returns true during the handover,
+    // causing setup_network() to waste time in the "waiting for ETH" loop.
+    xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+    want_eth_takeover = false;
+    xSemaphoreGive(connIpSemaphoreHandle);
+
+    // Step 1: Request reconnect FIRST so the main loop cleanly closes the
+    // old TCP connection (netconn_close + netconn_delete) before we kill WiFi.
+    // Without this, esp_wifi_disconnect() kills the TCP abruptly and the
+    // server may not detect the disconnect before our new HELLO arrives.
+    if (do_takeover) {
+      esp_err_t err = esp_netif_set_default_netif(pending_netif);
+      if (err == ESP_OK) {
+        xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+        we_changed_default_netif = true;
+        xSemaphoreGive(connIpSemaphoreHandle);
+      } else {
+        ESP_LOGE(TAG, "Failed to set default netif: %s", esp_err_to_name(err));
+      }
+    }
+
+    if (network_request_reconnect() != ESP_OK) {
+      ESP_LOGW(TAG, "Failed to request reconnect");
+    }
+
+    // Wait for main loop to close old connection (2s) + server cleanup
+    vTaskDelay(pdMS_TO_TICKS(2500));
+
+    // Now safe to suppress WiFi and apply unified MAC
+    ESP_LOGI(TAG, "Playback stopped: unifying MAC on Ethernet");
+    wifi_suppress_for_takeover();
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    esp_err_t mac_err = eth_apply_unified_mac(pending_netif);
+    if (mac_err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to apply unified MAC: %s, restoring WiFi",
+               esp_err_to_name(mac_err));
+      wifi_clear_suppression(true);
+      return;
+    }
+
+    if (do_takeover) {
+      esp_netif_dhcpc_stop(pending_netif);
+      esp_netif_dhcpc_start(pending_netif);
+      return;
+    }
+
+    if (!do_static_ip) {
+      esp_err_t err = esp_netif_set_default_netif(pending_netif);
+      if (err == ESP_OK) {
+        xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+        we_changed_default_netif = true;
+        xSemaphoreGive(connIpSemaphoreHandle);
+      } else {
+        ESP_LOGE(TAG, "Failed to set default netif: %s", esp_err_to_name(err));
+      }
+      esp_netif_dhcpc_stop(pending_netif);
+      esp_netif_dhcpc_start(pending_netif);
+      return;
+    }
+    // Static IP mode: fall through to static IP handling below
+  }
 
   // Handle pending static IP configuration
   if (do_static_ip) {
@@ -1174,6 +1453,15 @@ static void eth_on_playback_stopped(void) {
     ESP_LOGI(TAG, "Playback stopped: performing pending Ethernet takeover");
     esp_netif_t *eth_netif = network_get_netif_from_desc(NETWORK_INTERFACE_DESC_ETH);
     if (eth_netif) {
+      // Verify Ethernet has IP immediately to avoid race with disconnect event
+      if (!network_has_ip(eth_netif)) {
+        ESP_LOGD(TAG, "eth_on_playback_stopped: Ethernet has no IP, aborting takeover");
+        xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+        want_eth_takeover = false;
+        xSemaphoreGive(connIpSemaphoreHandle);
+        return;
+      }
+
       esp_err_t err = esp_netif_set_default_netif(eth_netif);
       if (err == ESP_OK) {
         xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
@@ -1245,6 +1533,9 @@ void eth_start(void) {
     return;
   }
 
+  // Save handles for deferred MAC unification
+  s_eth_handles = eth_handles;
+
 #if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
   esp_netif_t *eth_netif = NULL;
 
@@ -1279,6 +1570,7 @@ void eth_start(void) {
       eth_auto_disable_and_persist();
       return;
     }
+
   } else {
     // Use ESP_NETIF_INHERENT_DEFAULT_ETH when multiple Ethernet interfaces are
     // used and so you need to modify esp-netif configuration parameters for
@@ -1344,6 +1636,7 @@ void eth_start(void) {
         eth_auto_disable_and_persist();
         return;
       }
+
     }
   }
 

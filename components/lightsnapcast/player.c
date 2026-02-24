@@ -36,6 +36,7 @@
 #include "driver/i2s_std.h"
 #include "player.h"
 #include "snapcast.h"
+#include "../network_interface/include/network_interface.h"
 
 #define USE_SAMPLE_INSERTION CONFIG_USE_SAMPLE_INSERTION
 
@@ -562,6 +563,11 @@ int start_player(snapcastSetting_t *setting) {
   }
   xSemaphoreGive(playerStateMux);
 
+  // Set network playback state SYNCHRONOUSLY before Ethernet events can fire
+  // This prevents race condition where eth_check_and_apply_takeover() sees
+  // playback as inactive during the callback propagation window
+  network_playback_started();
+
   tg0_timer_init();
 
 #if CONFIG_PM_ENABLE
@@ -607,6 +613,19 @@ int start_player(snapcastSetting_t *setting) {
 
     pcmChkQHdl = xQueueCreate(entries, sizeof(pcm_chunk_message_t *));
 
+    if (pcmChkQHdl == NULL) {
+      ESP_LOGE(TAG, "FAILED to create PCM queue with %d entries (memory exhausted?)", entries);
+      vQueueDelete(snapcastSettingQueueHandle);
+      snapcastSettingQueueHandle = NULL;
+#if CONFIG_PM_ENABLE
+      esp_pm_lock_release(player_pm_lock_handle);
+#endif
+      tg0_timer_deinit();
+      playerStarted = false;
+      call_state_cb();
+      return -1;
+    }
+
     ESP_LOGI(TAG, "created new queue with %d", entries);
   }
 
@@ -628,15 +647,15 @@ void pause_player(bool pause) {
   if (pause != playerPaused) {
     playerPaused = pause;
     state_changed = true;
-    if (pause && playerTaskHandle != NULL) {
+    if (playerTaskHandle != NULL) {
       xTaskNotifyGiveIndexed(playerTaskHandle, 1);
     }
   }
   xSemaphoreGive(playerStateMux);
 
   // Call callbacks OUTSIDE the mutex to avoid reentrancy deadlock
-  if (state_changed && !pause) {
-    call_state_cb();  // notify state change, e.g. for http task to send pcm
+  if (state_changed) {
+    call_state_cb();  // notify state change on both pause and resume
   }
 }
 
@@ -1648,7 +1667,11 @@ static void player_task(void *pvParameters) {
 
           pcmChkQHdl = xQueueCreate(entries, sizeof(pcm_chunk_message_t *));
 
-          ESP_LOGI(TAG, "created new queue with %d", entries);
+          if (pcmChkQHdl != NULL) {
+            ESP_LOGI(TAG, "created new queue with %d", entries);
+          } else {
+            ESP_LOGE(TAG, "FAILED to create PCM queue with %d entries (memory exhausted?)", entries);
+          }
         }
 
         if ((scSet.sr != __scSet.sr) || (scSet.bits != __scSet.bits) ||
@@ -2204,12 +2227,20 @@ static void player_task(void *pvParameters) {
 
       break;
     }
-    if (ulTaskNotifyTakeIndexed(1, pdTRUE, 0) == pdTRUE) {
-      audio_set_mute(true);
-      my_i2s_channel_disable(tx_chan);
-      i2s_del_channel(tx_chan);
-      tx_chan = NULL;
-      break;
+    if (ulTaskNotifyTakeIndexed(1, pdTRUE, 0) != 0) {
+      // Check if we're actually pausing (playerPaused==true)
+      // Resume signals (playerPaused==false) should NOT break/stop playback
+      xSemaphoreTake(playerStateMux, portMAX_DELAY);
+      bool should_stop = playerPaused;
+      xSemaphoreGive(playerStateMux);
+
+      if (should_stop) {
+        audio_set_mute(true);
+        my_i2s_channel_disable(tx_chan);
+        i2s_del_channel(tx_chan);
+        tx_chan = NULL;
+        break;
+      }
     }
   }
   ret = 0;
@@ -2228,10 +2259,14 @@ static void player_task(void *pvParameters) {
 
   tg0_timer_deinit();
   playerStarted = false;
-  call_state_cb();
   ESP_LOGI(TAG, "stop player done");
 
   playerTaskHandle = NULL;
   xSemaphoreGive(playerStateMux);
+
+  // Call state callback AFTER releasing mutex to avoid deadlock
+  // (callbacks may try to acquire playerStateMux)
+  call_state_cb();
+
   vTaskDelete(NULL);
 }

@@ -189,6 +189,7 @@
     let currentEthDns = '';
     let ethAvailable = true; // whether Ethernet settings should be shown
     let isDirty = false;
+    let needsRestart = false;
 
     // Load current settings
     async function loadSettings() {

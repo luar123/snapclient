@@ -32,4 +32,16 @@ bool network_is_playback_active(void);
 /** Check if netif matches our interface prefix */
 bool network_is_our_netif(const char *prefix, esp_netif_t *netif);
 
+/** Get unified MAC address for all network interfaces */
+esp_err_t network_get_unified_mac_internal(uint8_t *mac_out);
+
+/** Suppress WiFi auto-reconnect during Ethernet MAC takeover */
+void wifi_suppress_for_takeover(void);
+
+/** Clear WiFi suppression, optionally triggering reconnect */
+void wifi_clear_suppression(bool reconnect);
+
+/** Check if WiFi is currently suppressed for takeover */
+bool wifi_is_suppressed(void);
+
 #endif /* COMPONENTS_NETWORK_INTERFACE_PRIV_INCLUDE_NETWORK_INTERFACE_PRIV_H_ */
