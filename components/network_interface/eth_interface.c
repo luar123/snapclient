@@ -840,12 +840,15 @@ static void eth_check_and_apply_takeover(esp_netif_t *netif) {
       // Suppress WiFi before applying unified MAC to prevent MAC flapping
       wifi_suppress_for_takeover();
       esp_wifi_disconnect();
-      vTaskDelay(pdMS_TO_TICKS(100));
 
       err = eth_apply_unified_mac(netif);
       if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to apply unified MAC: %s, restoring WiFi",
                  esp_err_to_name(err));
+        esp_netif_t *sta_netif = network_get_netif_from_desc(NETWORK_INTERFACE_DESC_STA);
+        if (sta_netif) {
+          esp_netif_set_default_netif(sta_netif);
+        }
         wifi_clear_suppression(true);
         xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
         want_eth_takeover = true;
@@ -1394,6 +1397,14 @@ static void eth_on_playback_stopped(void) {
       ESP_LOGE(TAG, "Failed to apply unified MAC: %s, restoring WiFi",
                esp_err_to_name(mac_err));
       wifi_clear_suppression(true);
+      esp_netif_t *sta_netif = network_get_netif_from_desc(NETWORK_INTERFACE_DESC_STA);
+      if (sta_netif) {
+        esp_netif_set_default_netif(sta_netif);
+      }
+      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+      we_changed_default_netif = false;
+      want_eth_takeover = true;  // allow retry
+      xSemaphoreGive(connIpSemaphoreHandle);
       return;
     }
 

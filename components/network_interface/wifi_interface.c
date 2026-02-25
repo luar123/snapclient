@@ -77,7 +77,7 @@ static esp_netif_t *esp_wifi_netif = NULL;
 static esp_netif_ip_info_t ip_info = {{0}, {0}, {0}};
 static bool connected = false;
 static SemaphoreHandle_t connIpSemaphoreHandle = NULL;
-static bool wifi_suppressed_for_takeover = false;
+static volatile bool wifi_suppressed_for_takeover = false;
 
 /* The event group allows multiple bits for each event,
    but we only care about one event - are we connected

@@ -600,6 +600,7 @@ int start_player(snapcastSetting_t *setting) {
 #endif
       tg0_timer_deinit();
       playerStarted = false;
+      network_playback_stopped();
       call_state_cb();
       return -1;
     }
@@ -622,6 +623,7 @@ int start_player(snapcastSetting_t *setting) {
 #endif
       tg0_timer_deinit();
       playerStarted = false;
+      network_playback_stopped();
       call_state_cb();
       return -1;
     }

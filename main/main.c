@@ -1368,7 +1368,7 @@ static void http_get_task(void *pvParameters) {
     network_check_and_clear_reconnect();
 
     // Main connection loop - state machine + data processing
-    bool paused = false;
+    paused = false;
     while (1) {
       // Check if external module requested reconnect (e.g., ethernet takeover)
       if (network_check_and_clear_reconnect()) {
