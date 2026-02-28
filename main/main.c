@@ -1618,7 +1618,6 @@ void app_main(void) {
 #endif
   audioDACdata_t dac_data;
   player_state_e state = IDLE;
-  int counter = 0;
   while (1) {
     if (xQueueReceive(audioDACQHdl, &dac_data, pdMS_TO_TICKS(100)) == pdTRUE) {
       dac_control(board_handle, dac_data);
@@ -1640,11 +1639,5 @@ void app_main(void) {
         state = state_new;
       }
     }
-    // test pause/play toggle every 200 loops
-    // counter++;
-    // if (counter % 200 == 0) {
-    //   ESP_LOGI(TAG, "toggle pause: %d", state == PLAYING);
-    //   pause_player(state == PLAYING);
-    // }
   }
 }

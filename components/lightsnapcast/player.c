@@ -617,14 +617,16 @@ void pause_player(bool pause) {
   xSemaphoreTake(playerStateMux, portMAX_DELAY);
   if (pause != playerPaused) {
     playerPaused = pause;
+    xSemaphoreGive(playerStateMux);
     if (pause && playerTaskHandle != NULL) {
       xTaskNotifyGiveIndexed(playerTaskHandle, 1);
     }
     if (!pause) {
       call_state_cb();  // notify state change, e.g. for http task to send pcm
     }
+  } else {
+    xSemaphoreGive(playerStateMux);
   }
-  xSemaphoreGive(playerStateMux);
 }
 
 player_state_e get_player_state(void) {
@@ -2180,25 +2182,16 @@ static void player_task(void *pvParameters) {
                  "diff2Server: %llds, %lld.%lldms",
                  uxQueueMessagesWaiting(pcmChkQHdl), sec, msec, usec);
       }
-
-      dir = 0;
-      initialSync = 0;
-
-      audio_set_mute(true);
-      my_i2s_channel_disable(tx_chan);
-      i2s_del_channel(tx_chan);
-      tx_chan = NULL;
-
       break;
     }
     if (ulTaskNotifyTakeIndexed(1, pdTRUE, 0) == pdTRUE) {
-      audio_set_mute(true);
-      my_i2s_channel_disable(tx_chan);
-      i2s_del_channel(tx_chan);
-      tx_chan = NULL;
       break;
     }
   }
+  audio_set_mute(true);
+  my_i2s_channel_disable(tx_chan);
+  i2s_del_channel(tx_chan);
+  tx_chan = NULL;
   ret = 0;
   xSemaphoreTake(playerStateMux, portMAX_DELAY);
   xSemaphoreTake(snapcastSettingsMux, portMAX_DELAY);
