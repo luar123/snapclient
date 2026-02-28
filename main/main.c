@@ -527,7 +527,6 @@ int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool)) {
 int server_settings_msg_received(
     server_settings_message_t *server_settings_message,
     snapcastSetting_t *scSet) {
-  static int volume = 0;
   // log mute state, buffer, latency
   ESP_LOGI(TAG, "Buffer length:  %ld", server_settings_message->buffer_ms);
   ESP_LOGI(TAG, "Latency:        %ld", server_settings_message->latency);
@@ -547,7 +546,7 @@ int server_settings_msg_received(
     set_mute_cb(server_settings_message->muted);
   }
 
-  if (volume != server_settings_message->volume) {
+  if (scSet->volume != server_settings_message->volume) {
 #if SNAPCAST_USE_SOFT_VOL
     if (!server_settings_message->muted) {
       dsp_processor_set_volome((double)server_settings_message->volume / 100);
@@ -558,7 +557,7 @@ int server_settings_msg_received(
   }
 
   scSet->muted = server_settings_message->muted;
-  volume = server_settings_message->volume;
+  scSet->volume = server_settings_message->volume;
 
   if (scSet->cDacLat_ms != server_settings_message->latency ||
       scSet->buf_ms != server_settings_message->buffer_ms) {

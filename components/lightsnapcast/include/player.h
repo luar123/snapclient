@@ -62,6 +62,7 @@ typedef struct snapcastSetting_s {
   i2s_data_bit_width_t bits;
 
   bool muted;
+  uint32_t volume;
 
   char *pcmBuf;
   uint32_t pcmBufSize;
