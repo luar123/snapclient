@@ -328,7 +328,7 @@ static int fill_buffer(bool* first_netbuf_processed, int* rc1,
 
     *rc1 = netbuf_data(firstNetBuf, (void**)start, len);
     if (*rc1 == ERR_OK) {
-      ESP_LOGD(TAG, "netconn rx, data len: %d, %d", len,
+      ESP_LOGD(TAG, "netconn rx, data len: %d, %d", *len,
                netbuf_len(firstNetBuf));
       return 0;
     } else {
