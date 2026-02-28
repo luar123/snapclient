@@ -1048,6 +1048,8 @@ int process_data(snapcast_protocol_parser_t *parser,
       if (parser_skip_typed_message(parser, &base_message_rx) != PARSER_OK) {
         return -1;
       }
+
+      ESP_LOGI(TAG, "done skipping typed message %d", base_message_rx.type);
       return 0;
     }
   }
