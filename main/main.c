@@ -569,8 +569,9 @@ void server_settings_msg_received(
                "Failed to notify sync task. "
                "Did you init player?");
 
-    // critical error
-    esp_restart();
+      // critical error
+      esp_restart();
+    }
   }
 }
 
