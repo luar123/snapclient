@@ -621,7 +621,7 @@ void pause_player(bool pause) {
     if (pause && playerTaskHandle != NULL) {
       xTaskNotifyGiveIndexed(playerTaskHandle, 1);
     }
-    if (!pause) {
+    else {
       call_state_cb();  // notify state change, e.g. for http task to send pcm
     }
   } else {
