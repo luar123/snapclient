@@ -139,7 +139,11 @@ void setup_network(esp_netif_t** netif) {
         continue;
       }
 
+    #if CONFIG_LWIP_IPV4 && !CONFIG_LWIP_IPV6
+      remote_ip.addr = re->addr->addr.u_addr.ip4.addr;
+    #else
       ip_addr_copy(remote_ip, re->addr->addr);
+    #endif
       remotePort = r->port;
 
       mdns_query_results_free(r);

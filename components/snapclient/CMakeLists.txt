@@ -1,7 +1,7 @@
 idf_component_register(SRCS "snapclient_helper.c" "snapclient.c" "connection_handler.c"
                        INCLUDE_DIRS "include"
 
-                       PRIV_REQUIRES esp_timer opus flac lightsnapcast
+                       PRIV_REQUIRES esp_timer mdns opus flac lightsnapcast
                        )
 
 if(CONFIG_USE_DSP_PROCESSOR)
