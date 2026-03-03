@@ -1003,7 +1003,7 @@ static bool IRAM_ATTR timer_group0_alarm_cb(
   uint64_t timer_counter_value = edata->count_value;
 
   // Notify the task in the task's notification value.
-  xTaskNotifyFromISR(playerTaskHandle, (uint32_t)timer_counter_value,
+  xTaskNotifyIndexedFromISR(playerTaskHandle, 0, (uint32_t)timer_counter_value,
                      eSetValueWithOverwrite, &xHigherPriorityTaskWoken);
 
   return xHigherPriorityTaskWoken == pdTRUE;
@@ -1771,7 +1771,7 @@ static void player_task(void *pvParameters) {
           }
 
           // Wait to be notified of a timer interrupt.
-          xTaskNotifyWait(pdFALSE,         // Don't clear bits on entry.
+          xTaskNotifyWaitIndexed(0, pdFALSE,         // Don't clear bits on entry.
                           pdFALSE,         // Don't clear bits on exit.
                           &notifiedValue,  // Stores the notified value.
                           portMAX_DELAY);
