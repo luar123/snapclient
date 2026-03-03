@@ -1,4 +1,4 @@
-name: build_lyrat_v4.3
+name: build_targets
 
 on: [push, pull_request]
 

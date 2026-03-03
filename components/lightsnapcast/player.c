@@ -514,7 +514,7 @@ int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*s
   
 #if USE_TIMEFILTER
   // init Kalmann time filter 
-  TIMEFILTER_Init(&latencyTimeFilter, 0.01, 0.0, 1.001, 0.75, 100);
+  TIMEFILTER_Init(&latencyTimeFilter, 0.01, 0.0, 1.001, 0.75, 100, 2.0);
 #else
   // init diff buff median filter
   latencyMedianFilter.numNodes = LATENCY_MEDIAN_FILTER_LEN;
@@ -530,7 +530,7 @@ int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*s
   MEDIANFILTER_Init(&miniMedianFilter);
   
   #if CONFIG_PM_ENABLE
-  esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "player", &player_pm_lock_handle);
+  esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "player", &player_pm_lock_handle);
   #endif
 
   ESP_LOGI(TAG, "init player done");
@@ -704,7 +704,7 @@ int32_t player_latency_insert(int64_t newValue, int64_t max_error, int64_t time_
   TIMEFILTER_Insert(&latencyTimeFilter, newValue, max_error, time_added);
   int64_t last_update_ = latencyTimeFilter.last_update_;
   double offset_ = latencyTimeFilter.offset_;
-  double drift_ = latencyTimeFilter.drift_;
+  double drift_ = latencyTimeFilter.use_drift_ ? latencyTimeFilter.drift_ : 0.0;
   if (xSemaphoreTake(latencyBufSemaphoreHandle, pdMS_TO_TICKS(0)) == pdTRUE) {
     if (TIMEFILTER_isFull(&latencyTimeFilter, LATENCY_TIME_FILTER_FULL)) {
       xSemaphoreGive(latencyBufFullSemaphoreHandle);
