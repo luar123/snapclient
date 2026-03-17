@@ -1,5 +1,6 @@
-#ifdef CONFIG_SNAPCLIENT_BT_ENABLED
 #include "bt_audio_task.h"
+
+#ifdef CONFIG_SNAPCLIENT_BT_ENABLED
 
 #include "esp_log.h"
 #include "driver/i2s_std.h"

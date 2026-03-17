@@ -1,5 +1,6 @@
-#ifdef CONFIG_SNAPCLIENT_BT_ENABLED
 #include "bt_audio_sink.h"
+
+#ifdef CONFIG_SNAPCLIENT_BT_ENABLED
 
 #include <stdint.h>
 #include <stdbool.h>
