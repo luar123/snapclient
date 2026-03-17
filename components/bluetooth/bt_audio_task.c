@@ -1,3 +1,4 @@
+#ifdef CONFIG_SNAPCLIENT_BT_ENABLED
 #include "bt_audio_task.h"
 
 #include "esp_log.h"
@@ -269,3 +270,4 @@ void free_audio_chunk(audio_chunk_t *pcmChunk) {
 
   return;
 }
+#endif

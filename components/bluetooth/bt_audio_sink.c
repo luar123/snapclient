@@ -1,3 +1,4 @@
+#ifdef CONFIG_SNAPCLIENT_BT_ENABLED
 #include "bt_audio_sink.h"
 
 #include <stdint.h>
@@ -453,3 +454,4 @@ static void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len) {
 //             break;
 //     }
 // }
+#endif
