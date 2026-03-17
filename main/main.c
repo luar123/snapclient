@@ -47,6 +47,10 @@
 #include "dsp_processor_settings.h"
 #endif
 
+#if CONFIG_SNAPCLIENT_BT_ENABLED
+#include "bt_audio_sink.h"
+#endif
+
 // Opus decoder is implemented as a subcomponet from master git repo
 #include "opus.h"
 
@@ -528,7 +532,7 @@ int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool)) {
  */
 void server_settings_msg_received(
     server_settings_message_t *server_settings_message,
-    snapcastSetting_t *scSet) {
+    snapcastSetting_t *scSet, bool playing) {
   // log mute state, buffer, latency
   ESP_LOGI(TAG, "Buffer length:  %ld", server_settings_message->buffer_ms);
   ESP_LOGI(TAG, "Latency:        %ld", server_settings_message->latency);
@@ -537,7 +541,7 @@ void server_settings_msg_received(
 
   // Volume setting using ADF HAL
   // abstraction
-  if (scSet->muted != server_settings_message->muted) {
+  if (playing && scSet->muted != server_settings_message->muted) {
 #if SNAPCAST_USE_SOFT_VOL
     if (server_settings_message->muted) {
       dsp_processor_set_volome(0.0);
@@ -548,7 +552,7 @@ void server_settings_msg_received(
     set_mute_cb(server_settings_message->muted);
   }
 
-  if (scSet->volume != server_settings_message->volume) {
+  if (playing && scSet->volume != server_settings_message->volume) {
 #if SNAPCAST_USE_SOFT_VOL
     if (!server_settings_message->muted) {
       dsp_processor_set_volome((double)server_settings_message->volume / 100);
@@ -788,7 +792,7 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
 
 #if CONFIG_USE_DSP_PROCESSOR
         if (new_pcmChunk->fragment->payload) {
-          dsp_processor_worker((void *)new_pcmChunk, (void *)scSet);
+          dsp_processor_worker(new_pcmChunk->fragment->payload, new_pcmChunk->fragment->size / ((scSet->bits / 8) * scSet->ch), scSet->sr, scSet->ch);
         }
 #endif
 
@@ -883,7 +887,7 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
 
 #if CONFIG_USE_DSP_PROCESSOR
         if (new_pcmChunk->fragment->payload) {
-          dsp_processor_worker((void *)new_pcmChunk, (void *)scSet);
+          dsp_processor_worker(new_pcmChunk->fragment->payload, new_pcmChunk->fragment->size / ((scSet->bits / 8) * scSet->ch), scSet->sr, scSet->ch);
         }
 
 #endif
@@ -947,7 +951,7 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
 
 #if CONFIG_USE_DSP_PROCESSOR
       if ((*pcmData) && ((*pcmData)->fragment->payload)) {
-        dsp_processor_worker((void *)(*pcmData), (void *)scSet);
+        dsp_processor_worker((*pcmData)->fragment->payload, (*pcmData)->fragment->size / ((scSet->bits / 8) * scSet->ch), scSet->sr, scSet->ch);
       }
 #endif
       if (*pcmData) {
@@ -981,7 +985,7 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
 int process_data(snapcast_protocol_parser_t *parser,
                  time_sync_data_t *time_sync_data, bool *received_codec_header,
                  codec_type_t *codec, snapcastSetting_t *scSet,
-                 pcm_chunk_message_t **pcmData, bool paused) {
+                 pcm_chunk_message_t **pcmData, player_state_e state) {
   base_message_t base_message_rx;
 
   if (parse_base_message(parser, &base_message_rx) != PARSER_OK) {
@@ -997,7 +1001,7 @@ int process_data(snapcast_protocol_parser_t *parser,
       wire_chunk_message_t wire_chnk = {{0, 0}, 0, NULL};  // is wire_chnk.payload ever used?
 
       // skip this wires chunk message if codec header message was not received yet!
-      if (*received_codec_header == false || paused) {
+      if (*received_codec_header == false || state == PAUSED) {
         if (parser_skip_typed_message(parser, &base_message_rx) != PARSER_OK) {
           return -1;
         }
@@ -1034,7 +1038,7 @@ int process_data(snapcast_protocol_parser_t *parser,
       if (parse_sever_settings_message(parser, &base_message_rx, &server_settings_message) != PARSER_OK) {
         return -1;
       }
-      server_settings_msg_received(&server_settings_message, scSet);
+      server_settings_msg_received(&server_settings_message, scSet, state == PLAYING);
       return 0;
     }
 
@@ -1109,7 +1113,7 @@ static void http_get_task(void *pvParameters) {
   codec_type_t codec = NONE;
   snapcastSetting_t scSet;
   pcm_chunk_message_t *pcmData = NULL;
-  bool paused = false;
+  player_state_e player_state = IDLE;
 
   // create a timer to send time sync messages every x µs
 //  esp_timer_create(&tSyncArgs, &time_sync_data.timeSyncMessageTimer);
@@ -1289,12 +1293,25 @@ static void http_get_task(void *pvParameters) {
     while (1) {
       if (ulTaskNotifyTake(pdTRUE, 1) == pdTRUE) {
         // state change, e.g. pause/play
-        paused = get_player_state() == PAUSED;
+        player_state_e state = get_player_state();
+        if (state != player_state && state == PLAYING) {
+#if SNAPCAST_USE_SOFT_VOL
+          if (!scSet.muted) {
+            dsp_processor_set_volome((double)scSet.volume / 100);
+          } else {
+            dsp_processor_set_volome(0.0);
+          }
+#else
+          set_volume_cb(scSet.volume);
+#endif
+          set_mute_cb(scSet.muted);
+        }
+        player_state = state;
       //ESP_LOGI(TAG, "http got cb. %s", paused ? "paused" : "playing/idle");
       }
       int result =
           process_data(&parser, &time_sync_data, &received_codec_header, &codec,
-                       &scSet, &pcmData, paused);
+                       &scSet, &pcmData, player_state);
       if (result != 0) {
         break;  // restart connection
       }
@@ -1373,6 +1390,71 @@ void player_state_changed() {
   }
   ESP_LOGI(TAG, "main task cb");
 }
+
+#ifdef CONFIG_SNAPCLIENT_DEBUG_MEM
+void log_mem() {
+  multi_heap_info_t info;
+  heap_caps_get_info(&info, MALLOC_CAP_8BIT);
+  ESP_LOGI(TAG, "Largest free block: %d bytes", info.largest_free_block);
+  ESP_LOGI(TAG, "Total free heap: %d bytes", info.total_free_bytes);
+  ESP_LOGI(TAG, "Minimum free heap ever: %d bytes", info.minimum_free_bytes);
+}
+
+ // This example demonstrates how a human readable table of run time stats
+ // information is generated from raw data provided by uxTaskGetSystemState().
+ // The human readable table is written to pcWriteBuffer
+ void GetRunTimeStats()
+ {
+ TaskStatus_t *pxTaskStatusArray;
+ volatile UBaseType_t uxArraySize, x;
+ configRUN_TIME_COUNTER_TYPE ulTotalRunTime, ulStatsAsPercentage;
+
+// Take a snapshot of the number of tasks in case it changes while this
+// function is executing.
+     uxArraySize = uxTaskGetNumberOfTasks();
+
+// Allocate a TaskStatus_t structure for each task.  An array could be
+// allocated statically at compile time.
+     pxTaskStatusArray = pvPortMalloc( uxArraySize * sizeof( TaskStatus_t ) );
+
+if( pxTaskStatusArray != NULL )
+     {
+// Generate raw status information about each task.
+         uxArraySize = uxTaskGetSystemState( pxTaskStatusArray, uxArraySize, &ulTotalRunTime );
+
+// For percentage calculations.
+         ulTotalRunTime /= 100UL;
+ESP_LOGI(TAG, "Name\t\tRuntime\t\tPercent\t\tHighWaterMark");
+// Avoid divide by zero errors.
+if( ulTotalRunTime > 0 )
+         {
+// For each populated position in the pxTaskStatusArray array,
+// format the raw data as human readable ASCII data
+for( x = 0; x < uxArraySize; x++ )
+             {
+// What percentage of the total run time has the task used?
+// This will always be rounded down to the nearest integer.
+// ulTotalRunTimeDiv100 has already been divided by 100.
+                 ulStatsAsPercentage = pxTaskStatusArray[ x ].ulRunTimeCounter / ulTotalRunTime;
+
+if( ulStatsAsPercentage > 0UL )
+                 {
+                     ESP_LOGI(TAG, "%s\t\t%lu\t\t%lu%%\t\t%lu", pxTaskStatusArray[ x ].pcTaskName, pxTaskStatusArray[ x ].ulRunTimeCounter, ulStatsAsPercentage, pxTaskStatusArray[ x ].usStackHighWaterMark );
+                 }
+else
+                 {
+// If the percentage is zero here then the task has
+// consumed less than 1% of the total run time.
+                     ESP_LOGI(TAG, "%s\t\t%lu\t\t<1%%\t\t%lu", pxTaskStatusArray[ x ].pcTaskName, pxTaskStatusArray[ x ].ulRunTimeCounter, pxTaskStatusArray[ x ].usStackHighWaterMark  );
+                 }
+             }
+         }
+
+// The array is no longer needed, free the memory it consumes.
+         vPortFree( pxTaskStatusArray );
+     }
+ }
+#endif
 
 /**
  *
@@ -1572,16 +1654,22 @@ void app_main(void) {
   
   #if CONFIG_ESP32_UDP_LOGGER_ENABLED
 //  esp32_udp_logger_set_hostname(mdns_hostname);
-  esp32_udp_logger_autostart();
+  //esp32_udp_logger_autostart();
   #endif
 
-  init_http_server_task();
+  //init_http_server_task();
 
   // Enable websocket server
   //  ESP_LOGI(TAG, "Setup ws server");
   //  websocket_if_start();
 
   net_mdns_register(mdns_hostname);
+
+#if CONFIG_SNAPCLIENT_BT_ENABLED
+  bt_audio_sink_init(I2S_NUM_0, i2s_pin_config0, audio_set_mute);
+  bt_audio_sink_start();
+#endif
+
 #ifdef CONFIG_SNAPCLIENT_SNTP_ENABLE
   set_time_from_sntp();
 #endif
@@ -1625,8 +1713,10 @@ void app_main(void) {
 #endif
   audioDACdata_t dac_data;
   player_state_e state = IDLE;
+  int count = 0;
+  uint32_t stop_time = 0;
   while (1) {
-    if (xQueueReceive(audioDACQHdl, &dac_data, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xQueueReceive(audioDACQHdl, &dac_data, pdMS_TO_TICKS(90)) == pdTRUE) {
       dac_control(board_handle, dac_data);
     }
     if (xSemaphoreTake(playerStateChangedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1635,16 +1725,46 @@ void app_main(void) {
       if (state_new != state) {
         ESP_LOGI(TAG, "Player state changed: %d -> %d", state, state_new);
         if (state_new == PLAYING) {
+#if CONFIG_SNAPCLIENT_BT_ENABLED
+          bt_audio_sink_stop();
+#endif
+#if CONFIG_SNAPCLIENT_BT_MODE_STOP
+          stop_time = 0;
+#endif
           audio_hal_ctrl_codec(board_handle->audio_hal,
                                 AUDIO_HAL_CODEC_MODE_DECODE,
                                 AUDIO_HAL_CTRL_START);
         } else if (state == PLAYING) {
-          audio_hal_ctrl_codec(board_handle->audio_hal,
-                                AUDIO_HAL_CODEC_MODE_DECODE,
-                                AUDIO_HAL_CTRL_STOP);
+#if CONFIG_SNAPCLIENT_BT_MODE_STOP
+          stop_time = esp_timer_get_time();
+#else
+#if CONFIG_SNAPCLIENT_BT_MODE_DISCONNECT
+          bt_audio_sink_start();
+#endif
+#endif
+          //audio_hal_ctrl_codec(board_handle->audio_hal,
+          //                      AUDIO_HAL_CODEC_MODE_DECODE,
+          //                      AUDIO_HAL_CTRL_STOP);
+#if CONFIG_SNAPCAST_USE_SOFT_VOL
+          dsp_processor_set_volome(1.0);
+#else
+          audio_set_volume(100);
+#endif
+
         }
         state = state_new;
       }
     }
+#if CONFIG_SNAPCLIENT_BT_MODE_STOP && CONFIG_SNAPCLIENT_PLAYER_TIMEOUT
+    if (stop_time && (esp_timer_get_time() > (stop_time + CONFIG_SNAPCLIENT_PLAYER_TIMEOUT))) {
+      esp_restart();
+    }
+#endif
+#ifdef CONFIG_SNAPCLIENT_DEBUG_MEM
+    if (count++%200==0) {
+      log_mem();
+      GetRunTimeStats();
+    }
+#endif
   }
 }
