@@ -111,7 +111,7 @@ static const char *TAG = "SC";
 SemaphoreHandle_t timeSyncSemaphoreHandle = NULL;
 
 SemaphoreHandle_t idCounterSemaphoreHandle = NULL;
-SemaphoreHandle_t playerStateChangedMutex = NULL;
+SemaphoreHandle_t snapcastStateChangedMutex = NULL;
 
 typedef struct audioDACdata_s {
   bool playerMute;
@@ -123,7 +123,8 @@ static audioDACdata_t audioDAC_data;
 static QueueHandle_t audioDACQHdl = NULL;
 static SemaphoreHandle_t audioDACSemaphore = NULL;
 static void (*set_volume_cb)(int volume);
-static void (*set_mute_cb)(bool mute);
+static void (*set_mute_cb)(bool mute, bool state);
+static SemaphoreHandle_t snapcastStateMux = NULL;
 
 void time_sync_msg_cb(void *args);
 
@@ -505,26 +506,89 @@ void error_callback(const FLAC__StreamDecoder *decoder,
            FLAC__StreamDecoderErrorStatusString[status]);
 }
 
-/**
- *
- */
-int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool)) {
-  if (set_volume == NULL) {
-    ESP_LOGE(TAG, "Volume callback is NULL");
+typedef enum { IDLE = 0, STOPPED, PLAYING, PAUSED } snapcast_state_t; //defined in player.h
+typedef enum { STOP = 0, START, RESTART, PAUSE, UNPAUSE } snapcast_commands_t;
 
-    return -1;
-  }
-  if (set_mute == NULL) {
-    ESP_LOGE(TAG, "Mute callback is NULL");
+typedef struct state_cb_s {
+  void (*cb)(void);
+  struct state_cb_s *next;
+} state_cb_t;
 
-    return -1;
-  }
-  set_volume_cb = set_volume;
-  set_mute_cb = set_mute;
+static snapcast_state_t sc_state = STOPPED;
+static state_cb_t *state_cb_head = NULL;
 
-  return 0;
+void player_set_mute(bool mute) {
+  set_mute_cb(mute, false);
 }
 
+void set_mute_state(bool mute) {
+  set_mute_cb(mute, true);
+}
+
+void sc_send_command(snapcast_commands_t command) {
+  if (t_http_get_task != NULL) {
+    xTaskNotify(t_http_get_task, (uint32_t) command, eSetValueWithOverwrite);
+  }
+}
+
+void player_state_paused(bool paused) {
+  if (paused) {
+    sc_send_command(PAUSE);
+  } else {
+    sc_send_command(UNPAUSE);
+  }
+}
+
+void sc_start_snapcast() {
+  sc_send_command(START);
+}
+
+void sc_restart_snapcast() {
+  sc_send_command(RESTART);
+}
+
+void sc_stop_snapcast() {
+  sc_send_command(STOP);
+}
+
+void sc_pause_snapcast(bool pause) {
+  pause_player(pause);
+    if (!pause) {
+      //sc_send_command(UNPAUSE);
+    }
+}
+
+snapcast_state_t sc_get_snapcast_state(void) {
+  xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+  snapcast_state_t state = sc_state;
+  xSemaphoreGive(snapcastStateMux);
+  return state;
+}
+
+void sc_call_state_cb(void) {
+  state_cb_t *current = state_cb_head;
+  while (current != NULL) {
+    if (current->cb != NULL) {
+      current->cb();
+    }
+    current = current->next;
+  }
+}
+
+/**
+ * add callback to be called when snapcast state changes, e.g. from not started to started.
+ * Callbacks needs to be implemented thread safe as they will be called from http task
+ */
+void sc_add_state_cb(void (*cb)()) {
+  state_cb_t *new_cb = malloc(sizeof(state_cb_t));
+  if (new_cb == NULL) {
+    ESP_LOGE(TAG, "Failed to allocate memory for state callback");
+    return;
+  }
+  new_cb->cb = cb;
+  new_cb->next = state_cb_head;
+  state_cb_head = new_cb;
+}
 
 
 /**
@@ -549,7 +613,7 @@ void server_settings_msg_received(
       dsp_processor_set_volome((double)server_settings_message->volume / 100);
     }
 #endif
-    set_mute_cb(server_settings_message->muted);
+    set_mute_state(server_settings_message->muted);
   }
 
   if (playing && scSet->volume != server_settings_message->volume) {
@@ -977,6 +1041,46 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
   }
 }
 
+void update_state(bool *received_wire_chnk, bool *playback, bool paused) {
+  static int64_t last = 0;
+  static snapcast_state_t state = IDLE; //Todo
+  if ((paused || state != PLAYING) && (!paused || state != PAUSED) && *received_wire_chnk) {
+    xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+    if (paused) {
+      sc_state = PAUSED;
+      *playback = false;
+      ESP_LOGI(TAG, "Set paused");
+    }else{
+      sc_state = PLAYING;
+      ESP_LOGI(TAG, "Set playing");
+      *playback = true;
+    }
+    state = sc_state;
+    xSemaphoreGive(snapcastStateMux);
+    sc_call_state_cb();
+    last = esp_timer_get_time();
+    *received_wire_chnk = false;
+  }
+  else if (state == PLAYING || state == PAUSED) {
+    int64_t now = esp_timer_get_time();
+    if (now-last > 1000000) { //update once per sec
+      if (!(*received_wire_chnk)) {
+        xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+        sc_state = IDLE;
+        *playback = false;
+        state = sc_state;
+        xSemaphoreGive(snapcastStateMux);
+        sc_call_state_cb();
+      ESP_LOGI(TAG, "Set idle");
+      }
+      last = now;
+      *received_wire_chnk = false;
+    }
+  }
+  
+}
+
+
 /*
  * returns:
  * 0 if a message was (partially) processed sucessfully
@@ -985,8 +1089,11 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
 int process_data(snapcast_protocol_parser_t *parser,
                  time_sync_data_t *time_sync_data, bool *received_codec_header,
                  codec_type_t *codec, snapcastSetting_t *scSet,
-                 pcm_chunk_message_t **pcmData, player_state_e state) {
+                 pcm_chunk_message_t **pcmData, bool *playback, bool paused) {
   base_message_t base_message_rx;
+
+  static bool received_wire_chnk = false;
+  update_state(&received_wire_chnk, playback, paused);
 
   if (parse_base_message(parser, &base_message_rx) != PARSER_OK) {
     return -1;  // restart connection
@@ -999,9 +1106,9 @@ int process_data(snapcast_protocol_parser_t *parser,
   switch (base_message_rx.type) {
     case SNAPCAST_MESSAGE_WIRE_CHUNK: {
       wire_chunk_message_t wire_chnk = {{0, 0}, 0, NULL};  // is wire_chnk.payload ever used?
-
+      received_wire_chnk = true;
       // skip this wires chunk message if codec header message was not received yet!
-      if (*received_codec_header == false || state == PAUSED) {
+      if (*received_codec_header == false || paused) {
         if (parser_skip_typed_message(parser, &base_message_rx) != PARSER_OK) {
           return -1;
         }
@@ -1038,7 +1145,7 @@ int process_data(snapcast_protocol_parser_t *parser,
       if (parse_sever_settings_message(parser, &base_message_rx, &server_settings_message) != PARSER_OK) {
         return -1;
       }
-      server_settings_msg_received(&server_settings_message, scSet, state == PLAYING);
+      server_settings_msg_received(&server_settings_message, scSet, *playback);
       return 0;
     }
 
@@ -1086,12 +1193,6 @@ void before_receive_callback(before_receive_callback_data_t *data) {
   }
 }
 
-
-void http_player_state_changed() {
-  xTaskNotifyGive(t_http_get_task);
-  //ESP_LOGI(TAG, "http task cb");
-}
-
 /**
  *
  */
@@ -1113,7 +1214,9 @@ static void http_get_task(void *pvParameters) {
   codec_type_t codec = NONE;
   snapcastSetting_t scSet;
   pcm_chunk_message_t *pcmData = NULL;
-  player_state_e player_state = IDLE;
+  uint32_t command = STOP;
+  bool paused = false;
+  bool playback = false;
 
   // create a timer to send time sync messages every x µs
 //  esp_timer_create(&tSyncArgs, &time_sync_data.timeSyncMessageTimer);
@@ -1124,8 +1227,6 @@ static void http_get_task(void *pvParameters) {
 
     esp_restart();
   }
-
-  add_player_state_cb(http_player_state_changed);
 
   while (1) {
     // do some house keeping
@@ -1159,6 +1260,21 @@ static void http_get_task(void *pvParameters) {
         decoderChunk.outData = NULL;
       }
     }
+
+    // block if state = STOPPED
+    xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+    if (sc_state == STOPPED) {
+      xSemaphoreGive(snapcastStateMux);
+      command = STOP;
+      while(command != START) {
+        xTaskNotifyWait( 0, 0, &command, portMAX_DELAY);
+      }
+      xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+    }
+    sc_state = IDLE;
+    xSemaphoreGive(snapcastStateMux);
+    sc_call_state_cb();
+    playback = false;
 
     // NETWORK setup ends here ( or before getting mac address )
     setup_network(&connection.netif);
@@ -1291,10 +1407,40 @@ static void http_get_task(void *pvParameters) {
 
     // Main connection loop - state machine + data processing
     while (1) {
-      if (ulTaskNotifyTake(pdTRUE, 1) == pdTRUE) {
-        // state change, e.g. pause/play
-        player_state_e state = get_player_state();
-        if (state != player_state && state == PLAYING) {
+      bool restart = false;
+      static bool playback_old = false;
+      if (xTaskNotifyWait(0, 0, &command, 1) == pdTRUE) {
+        switch(command) {
+          case STOP:
+            xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+            sc_state = STOPPED;
+            xSemaphoreGive(snapcastStateMux);
+            sc_call_state_cb();
+          case RESTART:
+            restart = true;
+            break;
+          case UNPAUSE:
+            paused = false;
+            break;
+          case PAUSE:
+            paused = true;
+            break;
+          default:
+            break;
+        }
+      //ESP_LOGI(TAG, "http got cb. %s", paused ? "paused" : "playing/idle");
+      }
+      if (restart) {
+        //restart required
+        netconn_close(lwipNetconn);
+        netconn_delete(lwipNetconn);
+        lwipNetconn = NULL;
+        break; // restart connection
+      }
+
+      if (playback_old != playback) {
+        if (playback) {
+          // need to apply settings when starting to play
 #if SNAPCAST_USE_SOFT_VOL
           if (!scSet.muted) {
             dsp_processor_set_volome((double)scSet.volume / 100);
@@ -1304,20 +1450,49 @@ static void http_get_task(void *pvParameters) {
 #else
           set_volume_cb(scSet.volume);
 #endif
-          set_mute_cb(scSet.muted);
+          set_mute_state(scSet.muted);
         }
-        player_state = state;
-      //ESP_LOGI(TAG, "http got cb. %s", paused ? "paused" : "playing/idle");
+        playback_old = playback;
       }
+
       int result =
           process_data(&parser, &time_sync_data, &received_codec_header, &codec,
-                       &scSet, &pcmData, player_state);
+                       &scSet, &pcmData, &playback, paused);
       if (result != 0) {
         break;  // restart connection
       }
     }
   }
 }
+
+/**
+ *
+ */
+int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool, bool), i2s_std_gpio_config_t i2s_pin_config0, i2s_port_t I2S_NUM_0) {
+  if (set_volume == NULL) {
+    ESP_LOGE(TAG, "Volume callback is NULL");
+
+    return -1;
+  }
+  if (set_mute == NULL) {
+    ESP_LOGE(TAG, "Mute callback is NULL");
+
+    return -1;
+  }
+  set_volume_cb = set_volume;
+  set_mute_cb = set_mute;
+  if (snapcastStateMux == NULL) {
+    snapcastStateMux = xSemaphoreCreateMutex();
+  }
+  init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute, player_state_paused);
+
+  xTaskCreatePinnedToCore(&http_get_task, "http", 15 * 1024, NULL,
+                        HTTP_TASK_PRIORITY, &t_http_get_task,
+                        HTTP_TASK_CORE_ID);
+
+  return 0;
+}
+
 
 /**
  *
@@ -1364,14 +1539,6 @@ void audio_set_mute(bool mute, bool set_state) {
   xSemaphoreGive(audioDACSemaphore);
 }
 
-void player_set_mute(bool mute) {
-  audio_set_mute(mute, false);
-}
-
-void set_mute_state(bool mute) {
-  audio_set_mute(mute, true);
-}
-
 /**
  *
  */
@@ -1384,9 +1551,9 @@ void audio_set_volume(int volume) {
   xSemaphoreGive(audioDACSemaphore);
 }
 
-void player_state_changed() {
-  if (playerStateChangedMutex != NULL) {
-    xSemaphoreGive(playerStateChangedMutex);
+void sc_state_changed() {
+  if (snapcastStateChangedMutex != NULL) {
+    xSemaphoreGive(snapcastStateChangedMutex);
   }
   ESP_LOGI(TAG, "main task cb");
 }
@@ -1624,14 +1791,14 @@ void app_main(void) {
   audioDAC_data.playerMute = true;
   audioDAC_data.volume = -1;
 
-  init_snapcast(audio_set_volume, set_mute_state);
-  init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute);
-  add_player_state_cb(player_state_changed);
+  init_snapcast(audio_set_volume, audio_set_mute, i2s_pin_config0, I2S_NUM_0);
+  //init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute);
+  sc_add_state_cb(sc_state_changed);
 
   // Create binary semaphore for player state change notification
-  playerStateChangedMutex = xSemaphoreCreateBinary();
-  if (playerStateChangedMutex == NULL) {
-    ESP_LOGE(TAG, "Failed to create playerStateChangedMutex");
+  snapcastStateChangedMutex = xSemaphoreCreateBinary();
+  if (snapcastStateChangedMutex == NULL) {
+    ESP_LOGE(TAG, "Failed to create snapcastStateChangedMutex");
     return;
   }
 
@@ -1681,10 +1848,7 @@ void app_main(void) {
 
   xTaskCreatePinnedToCore(&ota_server_task, "ota", 14 * 256, NULL,
                           OTA_TASK_PRIORITY, &t_ota_task, OTA_TASK_CORE_ID);
-
-  xTaskCreatePinnedToCore(&http_get_task, "http", 15 * 1024, NULL,
-                          HTTP_TASK_PRIORITY, &t_http_get_task,
-                          HTTP_TASK_CORE_ID);
+  sc_start_snapcast();
 
   //  while (1) {
   //    // audio_event_iface_msg_t msg;
@@ -1712,15 +1876,15 @@ void app_main(void) {
   esp_pm_configure(&pmConfig);
 #endif
   audioDACdata_t dac_data;
-  player_state_e state = IDLE;
+  snapcast_state_t state = IDLE;
   int count = 0;
   uint32_t stop_time = 0;
   while (1) {
     if (xQueueReceive(audioDACQHdl, &dac_data, pdMS_TO_TICKS(90)) == pdTRUE) {
       dac_control(board_handle, dac_data);
     }
-    if (xSemaphoreTake(playerStateChangedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      player_state_e state_new = get_player_state();
+    if (xSemaphoreTake(snapcastStateChangedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      snapcast_state_t state_new = sc_get_snapcast_state();
       ESP_LOGI(TAG, "main got cb: %d", state_new);
       if (state_new != state) {
         ESP_LOGI(TAG, "Player state changed: %d -> %d", state, state_new);

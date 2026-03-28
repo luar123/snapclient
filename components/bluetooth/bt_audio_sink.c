@@ -48,7 +48,6 @@ void bt_audio_sink_init(i2s_port_t i2sN, i2s_std_gpio_config_t pin_conf, void (*
 
     ESP_LOGI(TAG, "Initializing Bluetooth A2DP sink");
 
-    esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
     esp_bt_mem_release(ESP_BT_MODE_BLE);
     esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
 
@@ -162,16 +161,16 @@ void bt_audio_sink_stop() {
     }
 
     // Deinitialize AVRC FIRST
-    ret = esp_avrc_tg_deinit();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "AVRC TG deinit failed: %s", esp_err_to_name(ret));
-        return;
-    }
-    ret = esp_avrc_ct_deinit();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "AVRC CT deinit failed: %s", esp_err_to_name(ret));
-        return;
-    }
+    // ret = esp_avrc_tg_deinit();
+    // if (ret != ESP_OK) {
+    //     ESP_LOGE(TAG, "AVRC TG deinit failed: %s", esp_err_to_name(ret));
+    //     return;
+    // }
+    // ret = esp_avrc_ct_deinit();
+    // if (ret != ESP_OK) {
+    //     ESP_LOGE(TAG, "AVRC CT deinit failed: %s", esp_err_to_name(ret));
+    //     return;
+    // }
     vTaskDelay(pdMS_TO_TICKS(100));
     // Deinitialize A2DP after AVRC
     ret = esp_a2d_sink_deinit();

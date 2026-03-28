@@ -123,12 +123,7 @@ bool playerStarted = false;
 bool playerPaused = false;
 static SemaphoreHandle_t playerStateMux = NULL;
 
-typedef struct state_cb_s {
-  void (*cb)(void);
-  struct state_cb_s *next;
-} state_cb_t;
-
-static state_cb_t *state_cb_head = NULL;
+static void (*state_cb)(bool) = NULL;
 
 static void (*audio_set_mute)(bool mute);
 
@@ -463,13 +458,17 @@ int deinit_player(void) {
 /**
  *  call before http task creation!
  */
-int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*set_mute_cb)(bool)) {
+int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*set_mute_cb)(bool), void (*cb)(bool)) {
   int ret = 0;
   if (set_mute_cb == NULL) {
     ESP_LOGE(TAG, "set_mute_cb is NULL");
     return -1;
   }
   audio_set_mute = set_mute_cb;
+  if (cb != NULL) {
+    state_cb = cb;
+  }
+
 
   deinit_player();
 
@@ -629,41 +628,13 @@ void pause_player(bool pause) {
   }
 }
 
-player_state_e get_player_state(void) {
-  xSemaphoreTake(playerStateMux, portMAX_DELAY);
-  player_state_e state = IDLE;
-  if (playerPaused) {
-    state = PAUSED;
-  } else if (playerStarted) {
-    state = PLAYING;
-  }
-  xSemaphoreGive(playerStateMux);
-  return state;
-}
-
 void call_state_cb(void) {
-  state_cb_t *current = state_cb_head;
-  while (current != NULL) {
-    if (current->cb != NULL) {
-      current->cb();
-    }
-    current = current->next;
+  if (state_cb != NULL) {
+    xSemaphoreTake(playerStateMux, portMAX_DELAY);
+    bool paused = playerPaused;
+    xSemaphoreGive(playerStateMux);
+    state_cb(paused);
   }
-}
-
-/**
- * add callback to be called when player state changes, e.g. from not started to started.
- * Callbacks needs to be implemented thread safe as they will be called from player task
- */
-void add_player_state_cb(void (*cb)()) {
-  state_cb_t *new_cb = malloc(sizeof(state_cb_t));
-  if (new_cb == NULL) {
-    ESP_LOGE(TAG, "Failed to allocate memory for state callback");
-    return;
-  }
-  new_cb->cb = cb;
-  new_cb->next = state_cb_head;
-  state_cb_head = new_cb;
 }
 
 /**
@@ -2211,10 +2182,10 @@ static void player_task(void *pvParameters) {
 
   tg0_timer_deinit();
   playerStarted = false;
-  call_state_cb();
   ESP_LOGI(TAG, "stop player done");
   playerTaskHandle = NULL;
   xSemaphoreGive(playerStateMux);
+  call_state_cb();
   vTaskDelete(NULL);
 }
 
