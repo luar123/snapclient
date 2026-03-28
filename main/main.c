@@ -1920,7 +1920,7 @@ void app_main(void) {
       }
     }
 #if CONFIG_SNAPCLIENT_BT_MODE_STOP && CONFIG_SNAPCLIENT_PLAYER_TIMEOUT
-    if (stop_time && (esp_timer_get_time() > (stop_time + CONFIG_SNAPCLIENT_PLAYER_TIMEOUT))) {
+    if (stop_time && (esp_timer_get_time() > (stop_time + CONFIG_SNAPCLIENT_PLAYER_TIMEOUT*1000000UL))) {
       esp_restart();
     }
 #endif

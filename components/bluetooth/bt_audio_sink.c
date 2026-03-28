@@ -184,21 +184,26 @@ void bt_audio_sink_stop() {
         ESP_LOGE(TAG, "%s disable bluedroid failed: %s\n", __func__, esp_err_to_name(ret));
         return;
     }
+    vTaskDelay(pdMS_TO_TICKS(10));
     if ((ret = esp_bluedroid_deinit()) != ESP_OK) {
         ESP_LOGE(TAG, "%s deinit bluedroid failed: %s\n", __func__, esp_err_to_name(ret));
         return;
     }
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     if ((ret = esp_bt_controller_disable()) != ESP_OK) {
         ESP_LOGE(TAG, "%s disable controller failed: %s\n", __func__, esp_err_to_name(ret));
         return;
     }
+    vTaskDelay(pdMS_TO_TICKS(10));
     if ((ret = esp_bt_controller_deinit()) != ESP_OK) {
         ESP_LOGE(TAG, "%s deinit controller failed: %s\n", __func__, esp_err_to_name(ret));
         return;
     }
+    vTaskDelay(pdMS_TO_TICKS(10));
 #if CONFIG_SNAPCLIENT_BT_MODE_STOP
     esp_bt_mem_release(ESP_BT_MODE_BTDM);
+    ESP_LOGI(TAG, "Released all memory");
 #endif    
 }
 
