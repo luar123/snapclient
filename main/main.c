@@ -1574,11 +1574,14 @@ bool i2s_lock(bool lock, TickType_t wait) {
 static void handle_state_change(audio_board_handle_t board_handle, uint32_t *bt_stoptime, uint32_t *dac_stoptime) {
   static snapcast_state_t sc_state = STOPPED;
   snapcast_state_t sc_state_new = sc_get_snapcast_state();
+#if CONFIG_SNAPCLIENT_BT_ENABLED
   static bt_state_t bt_state = BT_STOPPED;
   bt_state_t bt_state_new = bt_get_bt_state();
+#endif
   if (sc_state_new != sc_state) {
     ESP_LOGI(TAG, "Snapcast state changed: %d -> %d", sc_state, sc_state_new);
     if (sc_state_new == PLAYING) {
+#if CONFIG_SNAPCLIENT_BT_ENABLED
 #if CONFIG_SNAPCLIENT_BT_MODE_CONNECTED
       bt_audio_sink_pause(true);
 #else
@@ -1587,11 +1590,13 @@ static void handle_state_change(audio_board_handle_t board_handle, uint32_t *bt_
 #if CONFIG_SNAPCLIENT_BT_MODE_STOP
       *bt_stoptime = 0;
 #endif
+#endif
       *dac_stoptime = 0;
       audio_hal_ctrl_codec(board_handle->audio_hal,
                             AUDIO_HAL_CODEC_MODE_DECODE,
                             AUDIO_HAL_CTRL_START);
     } else if (sc_state == PLAYING) {
+#if CONFIG_SNAPCLIENT_BT_ENABLED
 #if CONFIG_SNAPCLIENT_BT_MODE_STOP
       *bt_stoptime = esp_timer_get_time();
 #else
@@ -1599,6 +1604,7 @@ static void handle_state_change(audio_board_handle_t board_handle, uint32_t *bt_
       bt_audio_sink_start();
 #else
       bt_audio_sink_pause(false);
+#endif
 #endif
 #endif
 #if CONFIG_SNAPCAST_USE_SOFT_VOL
@@ -1610,6 +1616,7 @@ static void handle_state_change(audio_board_handle_t board_handle, uint32_t *bt_
     }
     sc_state = sc_state_new;
   }
+#if CONFIG_SNAPCLIENT_BT_ENABLED
   if (bt_state_new != bt_state) {
     ESP_LOGI(TAG, "BT state changed: %d -> %d", bt_state, bt_state_new);
     if (bt_state_new == BT_PLAYING) {
@@ -1624,6 +1631,7 @@ static void handle_state_change(audio_board_handle_t board_handle, uint32_t *bt_
     }
     bt_state = bt_state_new;
   }
+#endif
 }
 
 #ifdef CONFIG_SNAPCLIENT_DEBUG_MEM
