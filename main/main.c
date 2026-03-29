@@ -528,7 +528,7 @@ int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool)) {
  */
 void server_settings_msg_received(
     server_settings_message_t *server_settings_message,
-    snapcastSetting_t *scSet) {
+    snapcastSetting_t *scSet, bool playing) {
   // log mute state, buffer, latency
   ESP_LOGI(TAG, "Buffer length:  %ld", server_settings_message->buffer_ms);
   ESP_LOGI(TAG, "Latency:        %ld", server_settings_message->latency);
@@ -537,7 +537,7 @@ void server_settings_msg_received(
 
   // Volume setting using ADF HAL
   // abstraction
-  if (scSet->muted != server_settings_message->muted) {
+  if (playing && scSet->muted != server_settings_message->muted) {
 #if SNAPCAST_USE_SOFT_VOL
     if (server_settings_message->muted) {
       dsp_processor_set_volome(0.0);
@@ -548,7 +548,7 @@ void server_settings_msg_received(
     set_mute_cb(server_settings_message->muted);
   }
 
-  if (scSet->volume != server_settings_message->volume) {
+  if (playing && scSet->volume != server_settings_message->volume) {
 #if SNAPCAST_USE_SOFT_VOL
     if (!server_settings_message->muted) {
       dsp_processor_set_volome((double)server_settings_message->volume / 100);
@@ -981,7 +981,7 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
 int process_data(snapcast_protocol_parser_t *parser,
                  time_sync_data_t *time_sync_data, bool *received_codec_header,
                  codec_type_t *codec, snapcastSetting_t *scSet,
-                 pcm_chunk_message_t **pcmData, bool paused) {
+                 pcm_chunk_message_t **pcmData, player_state_e state) {
   base_message_t base_message_rx;
 
   if (parse_base_message(parser, &base_message_rx) != PARSER_OK) {
@@ -997,7 +997,7 @@ int process_data(snapcast_protocol_parser_t *parser,
       wire_chunk_message_t wire_chnk = {{0, 0}, 0, NULL};  // is wire_chnk.payload ever used?
 
       // skip this wires chunk message if codec header message was not received yet!
-      if (*received_codec_header == false || paused) {
+      if (*received_codec_header == false || state == PAUSED) {
         if (parser_skip_typed_message(parser, &base_message_rx) != PARSER_OK) {
           return -1;
         }
@@ -1034,7 +1034,7 @@ int process_data(snapcast_protocol_parser_t *parser,
       if (parse_sever_settings_message(parser, &base_message_rx, &server_settings_message) != PARSER_OK) {
         return -1;
       }
-      server_settings_msg_received(&server_settings_message, scSet);
+      server_settings_msg_received(&server_settings_message, scSet, state == PLAYING);
       return 0;
     }
 
@@ -1109,7 +1109,7 @@ static void http_get_task(void *pvParameters) {
   codec_type_t codec = NONE;
   snapcastSetting_t scSet;
   pcm_chunk_message_t *pcmData = NULL;
-  bool paused = false;
+  player_state_e player_state = IDLE;
 
   // create a timer to send time sync messages every x µs
 //  esp_timer_create(&tSyncArgs, &time_sync_data.timeSyncMessageTimer);
@@ -1289,12 +1289,25 @@ static void http_get_task(void *pvParameters) {
     while (1) {
       if (ulTaskNotifyTake(pdTRUE, 1) == pdTRUE) {
         // state change, e.g. pause/play
-        paused = get_player_state() == PAUSED;
+        player_state_e state = get_player_state();
+        if (state != player_state && state == PLAYING) {
+#if SNAPCAST_USE_SOFT_VOL
+          if (!scSet.muted) {
+            dsp_processor_set_volome((double)scSet.volume / 100);
+          } else {
+            dsp_processor_set_volome(0.0);
+          }
+#else
+          set_volume_cb(scSet.volume);
+#endif
+          set_mute_cb(scSet.muted);
+        }
+        player_state = state;
       //ESP_LOGI(TAG, "http got cb. %s", paused ? "paused" : "playing/idle");
       }
       int result =
           process_data(&parser, &time_sync_data, &received_codec_header, &codec,
-                       &scSet, &pcmData, paused);
+                       &scSet, &pcmData, player_state);
       if (result != 0) {
         break;  // restart connection
       }
@@ -1626,7 +1639,7 @@ void app_main(void) {
   audioDACdata_t dac_data;
   player_state_e state = IDLE;
   while (1) {
-    if (xQueueReceive(audioDACQHdl, &dac_data, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xQueueReceive(audioDACQHdl, &dac_data, pdMS_TO_TICKS(90)) == pdTRUE) {
       dac_control(board_handle, dac_data);
     }
     if (xSemaphoreTake(playerStateChangedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
