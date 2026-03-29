@@ -27,6 +27,10 @@ menu "Bluetooth A2DP Sink Configuration"
             config SNAPCLIENT_BT_MODE_DISCONNECT
                 bool "Stop and disconnect BT while Snapcast is playing."
 
+            config SNAPCLIENT_BT_MODE_CONNECTED
+                bool "Keep BT connected while Snapcast is playing, but stop audio."
+                depends on SPIRAM
+
             config SNAPCLIENT_BT_MODE_STOP
                 bool "Stop BT completely while Snapcast is playing."
         endchoice
