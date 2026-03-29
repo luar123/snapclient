@@ -507,7 +507,7 @@ void error_callback(const FLAC__StreamDecoder *decoder,
            FLAC__StreamDecoderErrorStatusString[status]);
 }
 
-typedef enum { IDLE = 0, STOPPED, PLAYING, PAUSED } snapcast_state_t; //defined in player.h
+typedef enum { STOPPED = 0, IDLE, PLAYING, PAUSED } snapcast_state_t; //defined in player.h
 typedef enum { STOP = 0, START, RESTART, PAUSE, UNPAUSE } snapcast_commands_t;
 
 typedef struct state_cb_s {
@@ -1571,6 +1571,61 @@ bool i2s_lock(bool lock, TickType_t wait) {
   }
 }
 
+static void handle_state_change(audio_board_handle_t board_handle, uint32_t *bt_stoptime, uint32_t *dac_stoptime) {
+  static snapcast_state_t sc_state = STOPPED;
+  snapcast_state_t sc_state_new = sc_get_snapcast_state();
+  static bt_state_t bt_state = BT_STOPPED;
+  bt_state_t bt_state_new = bt_get_bt_state();
+  if (sc_state_new != sc_state) {
+    ESP_LOGI(TAG, "Snapcast state changed: %d -> %d", sc_state, sc_state_new);
+    if (sc_state_new == PLAYING) {
+#if CONFIG_SNAPCLIENT_BT_MODE_CONNECTED
+      bt_audio_sink_pause(true);
+#else
+      bt_audio_sink_stop();
+#endif
+#if CONFIG_SNAPCLIENT_BT_MODE_STOP
+      *bt_stoptime = 0;
+#endif
+      *dac_stoptime = 0;
+      audio_hal_ctrl_codec(board_handle->audio_hal,
+                            AUDIO_HAL_CODEC_MODE_DECODE,
+                            AUDIO_HAL_CTRL_START);
+    } else if (sc_state == PLAYING) {
+#if CONFIG_SNAPCLIENT_BT_MODE_STOP
+      *bt_stoptime = esp_timer_get_time();
+#else
+#if CONFIG_SNAPCLIENT_BT_MODE_DISCONNECT
+      bt_audio_sink_start();
+#else
+      bt_audio_sink_pause(false);
+#endif
+#endif
+#if CONFIG_SNAPCAST_USE_SOFT_VOL
+      dsp_processor_set_volome(1.0);
+#else
+      audio_set_volume(100);
+#endif
+      *dac_stoptime = esp_timer_get_time();
+    }
+    sc_state = sc_state_new;
+  }
+  if (bt_state_new != bt_state) {
+    ESP_LOGI(TAG, "BT state changed: %d -> %d", bt_state, bt_state_new);
+    if (bt_state_new == BT_PLAYING) {
+      audio_hal_ctrl_codec(board_handle->audio_hal,
+                            AUDIO_HAL_CODEC_MODE_DECODE,
+                            AUDIO_HAL_CTRL_START);
+      sc_pause_snapcast(true);
+      *dac_stoptime = 0;
+    } else if (bt_state == BT_PLAYING) {
+      sc_pause_snapcast(false);
+      *dac_stoptime = esp_timer_get_time();
+    }
+    bt_state = bt_state_new;
+  }
+}
+
 #ifdef CONFIG_SNAPCLIENT_DEBUG_MEM
 void log_mem() {
   multi_heap_info_t info;
@@ -1849,6 +1904,7 @@ void app_main(void) {
 
 #if CONFIG_SNAPCLIENT_BT_ENABLED
   bt_audio_sink_init(I2S_NUM_0, i2s_pin_config0, audio_set_mute, i2s_lock);
+  bt_add_state_cb(sc_state_changed);
   bt_audio_sink_start();
 #endif
 
@@ -1891,48 +1947,20 @@ void app_main(void) {
   esp_pm_configure(&pmConfig);
 #endif
   audioDACdata_t dac_data;
-  snapcast_state_t state = IDLE;
   int count = 0;
+  uint32_t dac_stop_time = 0;
   uint32_t stop_time = 0;
   while (1) {
     if (xQueueReceive(audioDACQHdl, &dac_data, pdMS_TO_TICKS(90)) == pdTRUE) {
       dac_control(board_handle, dac_data);
     }
     if (xSemaphoreTake(snapcastStateChangedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      snapcast_state_t state_new = sc_get_snapcast_state();
-      ESP_LOGI(TAG, "main got cb: %d", state_new);
-      if (state_new != state) {
-        ESP_LOGI(TAG, "Player state changed: %d -> %d", state, state_new);
-        if (state_new == PLAYING) {
-#if CONFIG_SNAPCLIENT_BT_ENABLED
-          bt_audio_sink_stop();
-#endif
-#if CONFIG_SNAPCLIENT_BT_MODE_STOP
-          stop_time = 0;
-#endif
-          audio_hal_ctrl_codec(board_handle->audio_hal,
-                                AUDIO_HAL_CODEC_MODE_DECODE,
-                                AUDIO_HAL_CTRL_START);
-        } else if (state == PLAYING) {
-#if CONFIG_SNAPCLIENT_BT_MODE_STOP
-          stop_time = esp_timer_get_time();
-#else
-#if CONFIG_SNAPCLIENT_BT_MODE_DISCONNECT
-          bt_audio_sink_start();
-#endif
-#endif
-          //audio_hal_ctrl_codec(board_handle->audio_hal,
-          //                      AUDIO_HAL_CODEC_MODE_DECODE,
-          //                      AUDIO_HAL_CTRL_STOP);
-#if CONFIG_SNAPCAST_USE_SOFT_VOL
-          dsp_processor_set_volome(1.0);
-#else
-          audio_set_volume(100);
-#endif
-
-        }
-        state = state_new;
-      }
+      handle_state_change(board_handle, &stop_time, &dac_stop_time);
+    }
+    if (dac_stop_time && (esp_timer_get_time() > (dac_stop_time + 20000000UL))) { //turn off dac after 20 seconds of inactivity to save power and avoid noise
+      audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_DECODE, AUDIO_HAL_CTRL_STOP);
+      dac_stop_time = 0;
+      ESP_LOGI(TAG, "DAC stopped to save power");
     }
 #if CONFIG_SNAPCLIENT_BT_MODE_STOP && CONFIG_SNAPCLIENT_PLAYER_TIMEOUT
     if (stop_time && (esp_timer_get_time() > (stop_time + CONFIG_SNAPCLIENT_PLAYER_TIMEOUT*1000000UL))) {

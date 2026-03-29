@@ -22,8 +22,8 @@
 
 #define TAG "BT_AUDIO_SINK"
 
-static bool bt_connected = false;
-static esp_bd_addr_t bt_remote_addr;
+static volatile bool bt_connected = false;
+static esp_bd_addr_t bt_remote_addr = {0};
 
 static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param);
 static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param);
@@ -36,12 +36,85 @@ static void (*bt_set_mute)(bool, bool);
 static int sample_rate = 44100;
 static int ch_count = 2;
 
+typedef struct state_cb_s {
+  void (*cb)(void);
+  struct state_cb_s *next;
+} state_cb_t;
+
+static bt_state_t bt_state = BT_STOPPED;
+static volatile bool bt_paused = false;
+static state_cb_t *state_cb_head = NULL;
+static SemaphoreHandle_t btStateMux = NULL;
+
 #ifndef CONFIG_SNAPCLIENT_BT_PIN
 #define CONFIG_SNAPCLIENT_BT_PIN "0000"
 #endif
 
 // Transaction labels for AVRC commands
 #define APP_RC_CT_TL_GET_CAPS            (0)
+
+bt_state_t bt_get_bt_state(void) {
+  xSemaphoreTake(btStateMux, portMAX_DELAY);
+  bt_state_t state = bt_state;
+  xSemaphoreGive(btStateMux);
+  return state;
+}
+
+void bt_call_state_cb(void) {
+  state_cb_t *current = state_cb_head;
+  while (current != NULL) {
+    if (current->cb != NULL) {
+      current->cb();
+    }
+    current = current->next;
+  }
+}
+
+void bt_set_bt_state(bt_state_t new_state) {
+    xSemaphoreTake(btStateMux, portMAX_DELAY);
+    bt_state = new_state;
+    xSemaphoreGive(btStateMux);
+    bt_call_state_cb();
+}
+
+/**
+ * add callback to be called when snapcast state changes, e.g. from not started to started.
+ * Callbacks needs to be implemented thread safe as they will be called from http task
+ */
+void bt_add_state_cb(void (*cb)()) {
+  state_cb_t *new_cb = malloc(sizeof(state_cb_t));
+  if (new_cb == NULL) {
+    ESP_LOGE(TAG, "Failed to allocate memory for state callback");
+    return;
+  }
+  new_cb->cb = cb;
+  new_cb->next = state_cb_head;
+  state_cb_head = new_cb;
+}
+
+void bt_audio_sink_pause(bool pause) {
+    xSemaphoreTake(btStateMux, portMAX_DELAY);
+    if (bt_paused != pause) {
+        bt_paused = pause;
+        if (bt_state == BT_PLAYING) {
+            xSemaphoreGive(btStateMux);
+            if (pause) {
+                esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+            }
+        } else if (bt_state == BT_PAUSED) {
+            xSemaphoreGive(btStateMux);
+            if (!pause) {
+                esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+            }
+        } else {
+            xSemaphoreGive(btStateMux);
+        }
+    } else {
+        // No state change, just release the mutex
+        xSemaphoreGive(btStateMux);
+    }
+}
+
 
 void bt_audio_sink_init(i2s_port_t i2sN, i2s_std_gpio_config_t pin_conf, void (*set_mute_)(bool, bool), bool (*lock)(bool, TickType_t)) {
     bt_set_mute = set_mute_;
@@ -50,6 +123,12 @@ void bt_audio_sink_init(i2s_port_t i2sN, i2s_std_gpio_config_t pin_conf, void (*
 
     esp_bt_mem_release(ESP_BT_MODE_BLE);
     esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+
+    btStateMux = xSemaphoreCreateMutex();
+    if (btStateMux == NULL) {
+        ESP_LOGE(TAG, "Failed to create Bluetooth state mutex");
+        return;
+    }
 
     bt_audio_task_init(i2sN, pin_conf, set_mute_, lock);
 }
@@ -144,16 +223,21 @@ void bt_audio_sink_start() {
     esp_a2d_sink_set_delay_value(1200 + delay);
 
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+    xSemaphoreTake(btStateMux, portMAX_DELAY);
+    bt_state = BT_DISCONNECTED;
+    bt_paused = false;
+    xSemaphoreGive(btStateMux);
+    bt_call_state_cb();
 }
 
 void bt_audio_sink_stop() {
     esp_err_t ret;
-    bt_audio_task_stop();
 
     esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
 
     if (bt_connected) {
+        bt_audio_sink_pause(true);
         ret = esp_a2d_sink_disconnect(bt_remote_addr);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Disconnect failed: %s", esp_err_to_name(ret));
@@ -207,11 +291,9 @@ void bt_audio_sink_stop() {
 #if CONFIG_SNAPCLIENT_BT_MODE_STOP
     esp_bt_mem_release(ESP_BT_MODE_BTDM);
     ESP_LOGI(TAG, "Released all memory");
-#endif    
-}
+#endif
 
-bool bt_audio_sink_is_connected() {
-    return bt_connected;
+    bt_set_bt_state(BT_STOPPED);
 }
 
 static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
@@ -257,6 +339,7 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
                 esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
                 // Give Bluetooth priority over WiFi
                 esp_coex_preference_set(ESP_COEX_PREFER_BT);
+                bt_set_bt_state(BT_CONNECTED);
             } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
                 ESP_LOGI(TAG, "Bluetooth disconnected");
                 bt_connected = false;
@@ -265,24 +348,28 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
                 esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
                 // Restore WiFi priority
                 esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+                bt_set_bt_state(BT_DISCONNECTED);
             }
             break;
         case ESP_A2D_AUDIO_STATE_EVT:
             if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
+                if (bt_paused) {
+                    ESP_LOGI(TAG, "Bluetooth started playing while paused, sending suspend command");
+                    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+                    bt_set_bt_state(BT_PAUSED);
+                    break;
+                }
                 ESP_LOGI(TAG, "Bluetooth started playing");
-                //pause_player(true); //send callback
                 pcm_queue = bt_audio_task_start();
                 bt_set_mute(false, true); //unmute state
-
-    /* Get the default value of the delay value */
-    esp_a2d_sink_get_delay_value();
+                bt_set_bt_state(BT_PLAYING);
             } else if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND ||
                        param->audio_stat.state == ESP_A2D_AUDIO_STATE_STOPPED) {
                 ESP_LOGI(TAG, "Bluetooth stopped playing");
                 bt_set_mute(true, true); //mute state
                 pcm_queue = NULL;
                 bt_audio_task_stop();
-                //pause_player(false);
+                bt_set_bt_state(BT_CONNECTED);
             }
             break;
         /* when audio codec is configured, this event comes */
@@ -319,6 +406,10 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
             a2d = (esp_a2d_cb_param_t *)(param);
             if (ESP_A2D_INIT_SUCCESS == a2d->a2d_prof_stat.init_state) {
                 ESP_LOGI(TAG, "A2DP PROF STATE: Init Complete");
+                if (bt_remote_addr[0] != 0 || bt_remote_addr[1] != 0 || bt_remote_addr[2] != 0 || bt_remote_addr[3] != 0 || bt_remote_addr[4] != 0 || bt_remote_addr[5] != 0) {
+                    ESP_LOGI(TAG, "Reconnecting to previously connected device");
+                    esp_a2d_sink_connect(bt_remote_addr);
+                }
             } else {
                 ESP_LOGI(TAG, "A2DP PROF STATE: Deinit Complete");
             }
@@ -349,6 +440,16 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
         case ESP_A2D_SNK_GET_DELAY_VALUE_EVT: {
             a2d = (esp_a2d_cb_param_t *)(param);
             ESP_LOGI(TAG, "Get delay report value: delay_value: %u * 1/10 ms", a2d->a2d_get_delay_value_stat.delay_value);
+            break;
+        }
+        case ESP_A2D_MEDIA_CTRL_ACK_EVT: {
+            a2d = (esp_a2d_cb_param_t *)(param);
+            ESP_LOGI(TAG, "Media control ack: %u", a2d->media_ctrl_stat.cmd);
+            if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_SUSPEND) {
+                ESP_LOGI(TAG, "Media control suspend acknowledged");
+                bt_audio_task_stop();
+                pcm_queue = NULL;
+            }
             break;
         }
         default:
