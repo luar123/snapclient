@@ -106,8 +106,8 @@ static const char *TAG = "SC";
 // static QueueHandle_t playerChunkQueueHandle = NULL;
 SemaphoreHandle_t timeSyncSemaphoreHandle = NULL;
 
-SemaphoreHandle_t idCounterSemaphoreHandle = NULL;
-SemaphoreHandle_t snapcastStateChangedMutex = NULL;
+static SemaphoreHandle_t idCounterSemaphoreHandle = NULL;
+static SemaphoreHandle_t snapcastStateChangedMutex = NULL;
 
 typedef struct audioDACdata_s {
   bool playerMute;
@@ -121,6 +121,7 @@ static SemaphoreHandle_t audioDACSemaphore = NULL;
 static void (*set_volume_cb)(int volume);
 static void (*set_mute_cb)(bool mute, bool state);
 static SemaphoreHandle_t snapcastStateMux = NULL;
+static SemaphoreHandle_t i2sLockMutex = NULL;
 
 void time_sync_msg_cb(void *args);
 
@@ -502,7 +503,7 @@ void error_callback(const FLAC__StreamDecoder *decoder,
            FLAC__StreamDecoderErrorStatusString[status]);
 }
 
-typedef enum { IDLE = 0, STOPPED, PLAYING, PAUSED } snapcast_state_t; //defined in player.h
+typedef enum { STOPPED = 0, IDLE, PLAYING, PAUSED } snapcast_state_t; //defined in player.h
 typedef enum { STOP = 0, START, RESTART, PAUSE, UNPAUSE } snapcast_commands_t;
 
 typedef struct state_cb_s {
@@ -1464,7 +1465,7 @@ static void http_get_task(void *pvParameters) {
 /**
  *
  */
-int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool, bool), i2s_std_gpio_config_t i2s_pin_config0, i2s_port_t I2S_NUM_0) {
+int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool, bool), i2s_std_gpio_config_t i2s_pin_config0, i2s_port_t I2S_NUM_0, bool (*lock)(bool, TickType_t)) {
   if (set_volume == NULL) {
     ESP_LOGE(TAG, "Volume callback is NULL");
 
@@ -1480,7 +1481,7 @@ int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool, bool), i2s_std
   if (snapcastStateMux == NULL) {
     snapcastStateMux = xSemaphoreCreateMutex();
   }
-  init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute, player_state_paused);
+  init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute, player_state_paused, lock);
 
   xTaskCreatePinnedToCore(&http_get_task, "http", 15 * 1024, NULL,
                         HTTP_TASK_PRIORITY, &t_http_get_task,
@@ -1552,6 +1553,18 @@ void sc_state_changed() {
     xSemaphoreGive(snapcastStateChangedMutex);
   }
   ESP_LOGI(TAG, "main task cb");
+}
+
+bool i2s_lock(bool lock, TickType_t wait) {
+  if (i2sLockMutex == NULL) {
+    return false;
+  }
+  if (lock) {
+    return xSemaphoreTake(i2sLockMutex, wait);
+  }
+  else {
+    return xSemaphoreGive(i2sLockMutex);
+  }
 }
 
 /**
@@ -1722,7 +1735,9 @@ void app_main(void) {
   audioDAC_data.playerMute = true;
   audioDAC_data.volume = -1;
 
-  init_snapcast(audio_set_volume, audio_set_mute, i2s_pin_config0, I2S_NUM_0);
+  i2sLockMutex = xSemaphoreCreateBinary();
+
+  init_snapcast(audio_set_volume, audio_set_mute, i2s_pin_config0, I2S_NUM_0, i2s_lock);
   //init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute);
   sc_add_state_cb(sc_state_changed);
 
