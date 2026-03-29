@@ -12,7 +12,7 @@ typedef struct audio_chunk {
   char *payload;
 } audio_chunk_t;
 
-void bt_audio_task_init(i2s_port_t i2sN, i2s_std_gpio_config_t pin_conf, void (*set_mute)(bool, bool));
+void bt_audio_task_init(i2s_port_t i2sN, i2s_std_gpio_config_t pin_conf, void (*set_mute)(bool, bool), bool (*lock)(bool, TickType_t));
 QueueHandle_t *bt_audio_task_start();
 void bt_audio_task_stop();
 void bt_audio_set_rate(uint16_t samplerate, uint8_t channels);

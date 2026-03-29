@@ -43,7 +43,7 @@ static int ch_count = 2;
 // Transaction labels for AVRC commands
 #define APP_RC_CT_TL_GET_CAPS            (0)
 
-void bt_audio_sink_init(i2s_port_t i2sN, i2s_std_gpio_config_t pin_conf, void (*set_mute_)(bool, bool)) {
+void bt_audio_sink_init(i2s_port_t i2sN, i2s_std_gpio_config_t pin_conf, void (*set_mute_)(bool, bool), bool (*lock)(bool, TickType_t)) {
     bt_set_mute = set_mute_;
 
     ESP_LOGI(TAG, "Initializing Bluetooth A2DP sink");
@@ -51,7 +51,7 @@ void bt_audio_sink_init(i2s_port_t i2sN, i2s_std_gpio_config_t pin_conf, void (*
     esp_bt_mem_release(ESP_BT_MODE_BLE);
     esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
 
-    bt_audio_task_init(i2sN, pin_conf, set_mute_);
+    bt_audio_task_init(i2sN, pin_conf, set_mute_, lock);
 }
 
 void bt_audio_sink_start() {
@@ -148,6 +148,7 @@ void bt_audio_sink_start() {
 
 void bt_audio_sink_stop() {
     esp_err_t ret;
+    bt_audio_task_stop();
 
     esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
@@ -158,6 +159,7 @@ void bt_audio_sink_stop() {
             ESP_LOGE(TAG, "Disconnect failed: %s", esp_err_to_name(ret));
             return;
         }
+        vTaskDelay(pdMS_TO_TICKS(300));
     }
 
     // Deinitialize AVRC FIRST
@@ -171,13 +173,14 @@ void bt_audio_sink_stop() {
     //     ESP_LOGE(TAG, "AVRC CT deinit failed: %s", esp_err_to_name(ret));
     //     return;
     // }
-    vTaskDelay(pdMS_TO_TICKS(100));
+
     // Deinitialize A2DP after AVRC
     ret = esp_a2d_sink_deinit();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "A2DP sink deinit failed: %s", esp_err_to_name(ret));
         return;
     }
+    //vTaskDelay(pdMS_TO_TICKS(100));
 
     //shutdown bluetooth to save ram and power, we don't need it for now and it causes some issues with wifi
     if ((ret = esp_bluedroid_disable()) != ESP_OK) {
@@ -238,6 +241,7 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
             ESP_LOGI(TAG, "ESP_BT_GAP_MODE_CHG_EVT mode:%d", param->mode_chg.mode);
             break;
         default:
+            ESP_LOGI(TAG, "other gap event: %u", (uint8_t) event);
             break;
     }
 }
@@ -255,7 +259,9 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
                 esp_coex_preference_set(ESP_COEX_PREFER_BT);
             } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
                 ESP_LOGI(TAG, "Bluetooth disconnected");
-                bt_connected = false;;
+                bt_connected = false;
+                bt_audio_task_stop();
+                pcm_queue = NULL;
                 esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
                 // Restore WiFi priority
                 esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
@@ -263,7 +269,7 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
             break;
         case ESP_A2D_AUDIO_STATE_EVT:
             if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
-                ESP_LOGI(TAG, "Bluetooth started playing, pause player");
+                ESP_LOGI(TAG, "Bluetooth started playing");
                 //pause_player(true); //send callback
                 pcm_queue = bt_audio_task_start();
                 bt_set_mute(false, true); //unmute state
@@ -272,7 +278,7 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
     esp_a2d_sink_get_delay_value();
             } else if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND ||
                        param->audio_stat.state == ESP_A2D_AUDIO_STATE_STOPPED) {
-                ESP_LOGI(TAG, "Bluetooth stopped playing, giving back control to Snapcast");
+                ESP_LOGI(TAG, "Bluetooth stopped playing");
                 bt_set_mute(true, true); //mute state
                 pcm_queue = NULL;
                 bt_audio_task_stop();
@@ -346,6 +352,7 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
             break;
         }
         default:
+            ESP_LOGI(TAG, "other a2dp event: %u", (uint8_t) event);
             break;
     }
 }

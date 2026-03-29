@@ -16,6 +16,7 @@ static TaskHandle_t audio_task_hdl;
 void (*bt_audio_set_mute)(bool, bool);
 static uint16_t sr = 44100;
 static uint8_t ch = 2;
+static bool (*lock_i2s)(bool, TickType_t) = NULL;
 
 static void bt_audio_task(void *pvParameters) {
   xSemaphoreTake(i2s_task_mutex, portMAX_DELAY);
@@ -63,6 +64,9 @@ static void bt_audio_task(void *pvParameters) {
     tx_chan = NULL;
     ESP_LOGI(TAG, "tx channel disabled");
   }
+  if (lock_i2s != NULL) {
+    lock_i2s(false, 0);
+  }
   // Clear queue first
   while (uxQueueMessagesWaiting(bluetooth_pcm_queue)) {
     if (xQueueReceive(bluetooth_pcm_queue, &chunk, pdMS_TO_TICKS(20)) != pdFAIL) {
@@ -85,10 +89,11 @@ static void bt_audio_task(void *pvParameters) {
 }
 
 
-void bt_audio_task_init(i2s_port_t i2sN, i2s_std_gpio_config_t pin_conf, void (*set_mute)(bool, bool)) {
+void bt_audio_task_init(i2s_port_t i2sN, i2s_std_gpio_config_t pin_conf, void (*set_mute)(bool, bool), bool (*lock)(bool, TickType_t)) {
   bt_i2sNum = i2sN;
   bt_pin_config0 = pin_conf;
   bt_audio_set_mute = set_mute;
+  lock_i2s = lock; // can be NULL
 
   if (i2s_task_mutex == NULL) {
     i2s_task_mutex = xSemaphoreCreateMutex();
@@ -101,6 +106,9 @@ QueueHandle_t* bt_audio_task_start() {
     return NULL;
   }
   xSemaphoreGive(i2s_task_mutex);
+  if (lock_i2s != NULL) {
+    lock_i2s(true, portMAX_DELAY);
+  }
   bluetooth_pcm_queue = xQueueCreate(2, sizeof(audio_chunk_t *));
   if (tx_chan) {
     i2s_channel_disable(tx_chan);

@@ -124,8 +124,8 @@ bool playerPaused = false;
 static SemaphoreHandle_t playerStateMux = NULL;
 
 static void (*state_cb)(bool) = NULL;
-
 static void (*audio_set_mute)(bool mute);
+static bool (*lock_i2s)(bool, TickType_t) = NULL;
 
 static i2s_chan_handle_t tx_chan = NULL;  // I2S tx channel handler
 static bool i2sEnabled = false;
@@ -215,7 +215,14 @@ static void ensure_noiseless(i2s_chan_handle_t tx) {
 /**
  *
  */
-static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
+static esp_err_t player_setup_i2s(snapcastSetting_t *setting, bool lock) {
+
+  if (lock_i2s != NULL && lock) {
+    if (lock_i2s(true, pdMS_TO_TICKS(10)) != pdTRUE) {
+      return -1;
+    }
+  }
+
   // ensure save setting
   int32_t sr = setting->sr;
   if (sr == 0) {
@@ -419,6 +426,9 @@ int deinit_player(void) {
     i2s_del_channel(tx_chan);
     tx_chan = NULL;
   }
+  if (lock_i2s != NULL) {
+    lock_i2s(false, 0);
+  }
 
   if (playerStateMux != NULL) {
     vSemaphoreDelete(playerStateMux);
@@ -458,16 +468,15 @@ int deinit_player(void) {
 /**
  *  call before http task creation!
  */
-int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*set_mute_cb)(bool), void (*cb)(bool)) {
+int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*set_mute_cb)(bool), void (*cb)(bool), bool (*lock)(bool, TickType_t)) {
   int ret = 0;
   if (set_mute_cb == NULL) {
     ESP_LOGE(TAG, "set_mute_cb is NULL");
     return -1;
   }
   audio_set_mute = set_mute_cb;
-  if (cb != NULL) {
-    state_cb = cb;
-  }
+  state_cb = cb; // can be NULL
+  lock_i2s = lock; // can be NULL
 
 
   deinit_player();
@@ -552,7 +561,7 @@ int start_player(snapcastSetting_t *setting) {
   playerStarted = true;
   int ret = 0;
 
-  ret = player_setup_i2s(setting);
+  ret = player_setup_i2s(setting, true);
   if (ret < 0) {
     ESP_LOGE(TAG, "player_setup_i2s failed: %d", ret);
     playerStarted = false;
@@ -1575,7 +1584,7 @@ static void player_task(void *pvParameters) {
           audio_set_mute(true);
           my_i2s_channel_disable(tx_chan);
 
-          ret = player_setup_i2s(&__scSet);
+          ret = player_setup_i2s(&__scSet, false);
           if (ret < 0) {
             ESP_LOGE(TAG, "player_setup_i2s failed: %d", ret);
 
@@ -2166,7 +2175,9 @@ static void player_task(void *pvParameters) {
   my_i2s_channel_disable(tx_chan);
   i2s_del_channel(tx_chan);
   tx_chan = NULL;
-  ret = 0;
+  if (lock_i2s != NULL) {
+    lock_i2s(false, 0);
+  }
   xSemaphoreTake(playerStateMux, portMAX_DELAY);
   xSemaphoreTake(snapcastSettingsMux, portMAX_DELAY);
   // delete the queue
@@ -2178,7 +2189,7 @@ static void player_task(void *pvParameters) {
   esp_pm_lock_release(player_pm_lock_handle);
 #endif
 
-  ret = destroy_pcm_queue(&pcmChkQHdl);
+  destroy_pcm_queue(&pcmChkQHdl);
 
   tg0_timer_deinit();
   playerStarted = false;
