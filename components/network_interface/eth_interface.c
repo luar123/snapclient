@@ -112,6 +112,8 @@ static TaskHandle_t playback_monitor_task_handle = NULL;
 /* Forward declaration for playback stopped handler */
 static void eth_on_playback_stopped(void);
 
+extern void sc_restart_snapcast(void);
+
 /**
  * @brief Task that monitors playback events and triggers pending operations
  *
@@ -866,17 +868,13 @@ static void eth_check_and_apply_takeover(esp_netif_t *netif) {
       esp_netif_dhcpc_stop(netif);
       esp_netif_dhcpc_start(netif);
 
-      if (network_request_reconnect() != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to request reconnect after takeover");
-      }
+      sc_restart_snapcast();
     } else {
       // No MAC unification needed - just complete takeover
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
       we_changed_default_netif = true;
       xSemaphoreGive(connIpSemaphoreHandle);
-      if (network_request_reconnect() != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to request reconnect after takeover");
-      }
+      sc_restart_snapcast();
     }
   } else if (want_eth_takeover && network_is_playback_active()) {
     ESP_LOGI(TAG, "Playback active; deferring Ethernet takeover until playback stops");
@@ -1176,9 +1174,7 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
           esp_netif_set_default_netif(sta_netif);
         }
         /* Request reconnect so main re-evaluates network and uses WiFi */
-        if (network_request_reconnect() != ESP_OK) {
-          ESP_LOGW(TAG, "Failed to request reconnect for WiFi fallback");
-        }
+        sc_restart_snapcast();
       } else {
         /* Preserve want_eth_takeover on brief disconnect - if Ethernet reconnects
          * quickly, we still want to complete the takeover. Only clear if we
@@ -1378,10 +1374,7 @@ static void eth_on_playback_stopped(void) {
         ESP_LOGE(TAG, "Failed to set default netif: %s", esp_err_to_name(err));
       }
     }
-
-    if (network_request_reconnect() != ESP_OK) {
-      ESP_LOGW(TAG, "Failed to request reconnect");
-    }
+    sc_restart_snapcast();
 
     // Wait for main loop to close old connection (2s) + server cleanup
     vTaskDelay(pdMS_TO_TICKS(2500));
@@ -1478,9 +1471,7 @@ static void eth_on_playback_stopped(void) {
         xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
         we_changed_default_netif = true;
         xSemaphoreGive(connIpSemaphoreHandle);
-        if (network_request_reconnect() != ESP_OK) {
-          ESP_LOGW(TAG, "Failed to request reconnect after deferred takeover");
-        }
+        sc_restart_snapcast();
       } else {
         ESP_LOGE(TAG, "Failed to set default netif: %s", esp_err_to_name(err));
         // Restore takeover intent so it can be retried

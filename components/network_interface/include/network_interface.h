@@ -47,9 +47,6 @@ void network_if_init(void);
 /** Initialize network event group (call early in startup) */
 void network_events_init(void);
 
-/** Check and clear reconnect request (thread-safe, returns true if requested) */
-bool network_check_and_clear_reconnect(void);
-
 /** Signal that playback has started (thread-safe)
  * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized */
 esp_err_t network_playback_started(void);

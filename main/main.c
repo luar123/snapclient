@@ -103,7 +103,6 @@ TaskHandle_t t_http_get_task = NULL;
 /* Logging tag */
 static const char *TAG = "SC";
 
-
 // static QueueHandle_t playerChunkQueueHandle = NULL;
 SemaphoreHandle_t timeSyncSemaphoreHandle = NULL;
 
@@ -1439,7 +1438,6 @@ static void http_get_task(void *pvParameters) {
     netconn_set_recvtimeout(lwipNetconn, time_sync_data.timeout / 1000); // timeout in ms
 
     // Main connection loop - state machine + data processing
-    paused = false;
     while (1) {
       bool restart = false;
       static bool playback_old = false;

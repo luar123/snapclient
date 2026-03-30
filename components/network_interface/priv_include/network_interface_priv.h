@@ -23,9 +23,6 @@
 /** Get the network event group handle */
 EventGroupHandle_t network_get_event_group(void);
 
-/** Request network reconnection */
-esp_err_t network_request_reconnect(void);
-
 /** Check if playback is currently active */
 bool network_is_playback_active(void);
 
