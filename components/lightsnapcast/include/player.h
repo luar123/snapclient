@@ -51,31 +51,19 @@ typedef struct pcmData {
 
 typedef enum codec_type_e { NONE = 0, PCM, FLAC, OGG, OPUS } codec_type_t;
 
-typedef struct snapcastSetting_s {
-  uint32_t buf_ms;
-  uint32_t chkInFrames;
-  int32_t cDacLat_ms;
-
-  codec_type_t codec;
+typedef struct playerSetting_s {
+  uint16_t buf_ms;
+  uint16_t chkInFrames;
+  int16_t cDacLat_ms;
   int32_t sr;
   uint8_t ch;
   i2s_data_bit_width_t bits;
+} playerSetting_t;
 
-  bool muted;
-
-  char *pcmBuf;
-  uint32_t pcmBufSize;
-} snapcastSetting_t;
-
-typedef enum { IDLE = 0, PLAYING, PAUSED } player_state_e;
-int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*set_mute_cb)(bool));
+int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*set_mute_cb)(bool), void (*cb)(bool),  bool (*lock)(bool, TickType_t));
 int deinit_player(void);
-int start_player(snapcastSetting_t *setting);
+int start_player(void);
 void pause_player(bool pause);
-
-void call_state_cb(void);
-void add_player_state_cb(void (*cb)(void));
-player_state_e get_player_state(void);
 
 int32_t allocate_pcm_chunk_memory(pcm_chunk_message_t **pcmChunk, size_t bytes);
 int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk);
@@ -92,8 +80,7 @@ int32_t player_latency_insert(int64_t newValue);
 int32_t get_diff_to_server(int64_t *tDiff, int64_t now);
 int32_t latency_buffer_full(bool *is_full);
 
-int32_t player_send_snapcast_setting(snapcastSetting_t *setting);
-int8_t player_get_snapcast_settings(snapcastSetting_t *setting);
+int32_t player_send_snapcast_setting(playerSetting_t *setting);
 
 int32_t reset_latency_buffer(void);
 

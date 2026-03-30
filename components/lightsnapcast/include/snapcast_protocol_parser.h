@@ -22,10 +22,8 @@ typedef struct {
 } snapcast_protocol_parser_t;
 
 typedef enum {
-  PARSER_COMPLETE = 0,
-  PARSER_INCOMPLETE,
-  PARSER_CRITICAL_ERROR,
-  PARSER_CONNECTION_ERROR,
+  PARSER_OK = 0,
+  PARSER_RESTART_CONNECTION,
 } parser_return_state_t;
 
 parser_return_state_t parse_base_message(snapcast_protocol_parser_t* parser,
@@ -33,7 +31,6 @@ parser_return_state_t parse_base_message(snapcast_protocol_parser_t* parser,
 
 parser_return_state_t parse_wire_chunk_message(snapcast_protocol_parser_t* parser,
                                                base_message_t* base_message_rx,
-                                               bool received_codec_header,
                                                codec_type_t codec,
                                                pcm_chunk_message_t** pcmData,
                                                wire_chunk_message_t* wire_chnk,
@@ -52,7 +49,7 @@ parser_return_state_t parse_time_message(snapcast_protocol_parser_t* parser,
                                          base_message_t* base_message_rx,
                                          time_message_t* time_message_rx);
 
-parser_return_state_t parse_unknown_message(snapcast_protocol_parser_t* parser,
-                                            base_message_t* base_message_rx);
+parser_return_state_t parser_skip_typed_message(snapcast_protocol_parser_t* parser,
+                                                base_message_t* base_message_rx);
 
 #endif  // __SNAPCAST_PROTOCOL_PARSER_H__
