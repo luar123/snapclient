@@ -50,6 +50,9 @@ static SemaphoreHandle_t mac_mutex = NULL;
 static EventGroupHandle_t network_event_group = NULL;
 static bool network_events_initialized = false;
 
+typedef enum { STOPPED = 0, IDLE, PLAYING, PAUSED } snapcast_state_t;
+extern snapcast_state_t sc_get_snapcast_state(void);
+
 void network_events_init(void) {
     if (network_events_initialized) {
         ESP_LOGW(TAG, "Network events already initialized");
@@ -108,7 +111,7 @@ bool network_is_playback_active(void) {
 
     // Fallback: Direct player state check (catches edge cases)
     // This protects against race conditions if event bit isn't set yet
-    player_state_e state = get_player_state();
+    snapcast_state_t state = sc_get_snapcast_state();
     return (state == PLAYING);
 }
 
