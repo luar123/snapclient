@@ -109,6 +109,13 @@ SemaphoreHandle_t timeSyncSemaphoreHandle = NULL;
 static SemaphoreHandle_t idCounterSemaphoreHandle = NULL;
 static SemaphoreHandle_t snapcastStateChangedMutex = NULL;
 
+typedef struct snapcastSetting_s {
+  playerSetting_t playerSetting;
+
+  bool muted;
+  uint32_t volume;
+} snapcastSetting_t;
+
 typedef struct audioDACdata_s {
   bool playerMute;
   bool stateMute;
@@ -317,10 +324,10 @@ void time_sync_msg_received(base_message_t *base_message_rx,
 static FLAC__StreamDecoderReadStatus read_callback(
     const FLAC__StreamDecoder *decoder, FLAC__byte buffer[], size_t *bytes,
     void *client_data) {
-  snapcastSetting_t *scSet = (snapcastSetting_t *)client_data;
+  //snapcastSetting_t *scSet = (snapcastSetting_t *)client_data;
   //  decoderData_t *flacData;
 
-  (void)scSet;
+  //(void)scSet;
 
   // xQueueReceive(decoderReadQHdl, &flacData, portMAX_DELAY);
   // if (xQueueReceive(decoderReadQHdl, &flacData, pdMS_TO_TICKS(100)))
@@ -386,7 +393,7 @@ static FLAC__StreamDecoderWriteStatus write_callback(
     const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
     const FLAC__int32 *const buffer[], void *client_data) {
   size_t i;
-  snapcastSetting_t *scSet = (snapcastSetting_t *)client_data;
+  playerSetting_t *scSet = (playerSetting_t *)client_data;
 
   size_t bytes = frame->header.blocksize * frame->header.channels *
                  frame->header.bits_per_sample / 8;
@@ -473,7 +480,7 @@ static FLAC__StreamDecoderWriteStatus write_callback(
 void metadata_callback(const FLAC__StreamDecoder *decoder,
                        const FLAC__StreamMetadata *metadata,
                        void *client_data) {
-  snapcastSetting_t *scSet = (snapcastSetting_t *)client_data;
+  playerSetting_t *scSet = (playerSetting_t *)client_data;
 
   (void)decoder;
 
@@ -626,12 +633,12 @@ void server_settings_msg_received(
   scSet->muted = server_settings_message->muted;
   scSet->volume = server_settings_message->volume;
 
-  if (scSet->cDacLat_ms != server_settings_message->latency ||
-      scSet->buf_ms != server_settings_message->buffer_ms) {
-    scSet->cDacLat_ms = server_settings_message->latency;
-    scSet->buf_ms = server_settings_message->buffer_ms;
+  if (scSet->playerSetting.cDacLat_ms != server_settings_message->latency ||
+      scSet->playerSetting.buf_ms != server_settings_message->buffer_ms) {
+    scSet->playerSetting.cDacLat_ms = server_settings_message->latency;
+    scSet->playerSetting.buf_ms = server_settings_message->buffer_ms;
 
-    if (player_send_snapcast_setting(scSet) != pdPASS) {
+    if (playing && player_send_snapcast_setting(&(scSet->playerSetting)) != pdPASS) {
       ESP_LOGE(TAG,
                "Failed to notify sync task. "
                "Did you init player?");
@@ -646,7 +653,7 @@ void server_settings_msg_received(
  *
  */
 void codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
-                           codec_type_t codec, snapcastSetting_t *scSet,
+                           codec_type_t codec, playerSetting_t *scSet,
                            time_sync_data_t *time_sync_data) {
   // first ensure everything is set up
   // correctly and resources are
@@ -672,7 +679,6 @@ void codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
     memcpy(&bits, codecPayload + 8, sizeof(bits));
     memcpy(&channels, codecPayload + 10, sizeof(channels));
 
-    scSet->codec = codec;
     scSet->bits = bits;
     scSet->ch = channels;
     scSet->sr = rate;
@@ -731,7 +737,6 @@ void codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
     memcpy(&rate, codecPayload + 24, sizeof(rate));
     memcpy(&bits, codecPayload + 34, sizeof(bits));
 
-    scSet->codec = codec;
     scSet->bits = bits;
     scSet->ch = channels;
     scSet->sr = rate;
@@ -769,9 +774,10 @@ void codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
 /**
  *
  */
-void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
+void handle_chunk_message(codec_type_t codec, playerSetting_t *scSet,
                           pcm_chunk_message_t **pcmData,
                           wire_chunk_message_t *wire_chnk) {
+  static uint32_t chkInFrames = 0;
   switch (codec) {
     case OPUS: {
       int frame_size = -1;
@@ -827,6 +833,20 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
 
       // ESP_LOGW(TAG, "OPUS decode: %d", frame_size);
 
+      if (chkInFrames != scSet->chkInFrames) {
+        if (player_send_snapcast_setting(scSet) != pdPASS) {
+          ESP_LOGE(TAG,
+                   "Failed to notify "
+                   "sync task about "
+                   "codec. Did you "
+                   "init player?");
+
+          // critical error
+          esp_restart();
+        }
+        chkInFrames = scSet->chkInFrames;
+      }
+
       if (allocate_pcm_chunk_memory(&new_pcmChunk, bytes) < 0) {
         *pcmData = NULL;
       } else {
@@ -853,22 +873,13 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
 
 #if CONFIG_USE_DSP_PROCESSOR
         if (new_pcmChunk->fragment->payload) {
-          dsp_processor_worker((void *)new_pcmChunk, (void *)scSet);
+          dsp_processor_worker(new_pcmChunk->fragment->payload,
+            new_pcmChunk->fragment->size / ((scSet->bits / 8) * scSet->ch),
+            scSet->sr, scSet->ch);
         }
 #endif
 
         insert_pcm_chunk(new_pcmChunk);
-      }
-
-      if (player_send_snapcast_setting(scSet) != pdPASS) {
-        ESP_LOGE(TAG,
-                 "Failed to notify "
-                 "sync task about "
-                 "codec. Did you "
-                 "init player?");
-
-        // critical error
-        esp_restart();
       }
 
       break;
@@ -914,6 +925,21 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
       // ESP_LOGI(TAG, "new_pcmChunk with size %ld",
       // new_pcmChunk->totalSize);
 
+
+      if (chkInFrames != scSet->chkInFrames) {
+        if (player_send_snapcast_setting(scSet) != pdPASS) {
+          ESP_LOGE(TAG,
+                   "Failed to notify "
+                   "sync task about "
+                   "codec. Did you "
+                   "init player?");
+
+          // critical error
+          esp_restart();
+        }
+        chkInFrames = scSet->chkInFrames;
+      }
+
       if (ret == 0) {
         pcm_chunk_fragment_t *fragment = new_pcmChunk->fragment;
         uint32_t fragmentCnt = 0;
@@ -948,7 +974,9 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
 
 #if CONFIG_USE_DSP_PROCESSOR
         if (new_pcmChunk->fragment->payload) {
-          dsp_processor_worker((void *)new_pcmChunk, (void *)scSet);
+          dsp_processor_worker(new_pcmChunk->fragment->payload,
+            new_pcmChunk->fragment->size / ((scSet->bits / 8) * scSet->ch),
+            scSet->sr, scSet->ch);
         }
 
 #endif
@@ -964,19 +992,6 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
       free(pcmChunk.outData);
       pcmChunk.outData = NULL;
       pcmChunk.bytes = 0;
-
-      if (player_send_snapcast_setting(scSet) != pdPASS) {
-        ESP_LOGE(TAG,
-                 "Failed to "
-                 "notify "
-                 "sync task "
-                 "about "
-                 "codec. Did you "
-                 "init player?");
-
-        // critical error
-        esp_restart();
-      }
 
       break;
     }
@@ -999,20 +1014,26 @@ void handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
       //          "got PCM decoded chunk size: %ld
       //          frames", scSet->chkInFrames);
 
-      if (player_send_snapcast_setting(scSet) != pdPASS) {
-        ESP_LOGE(TAG,
-                 "Failed to notify "
-                 "sync task about "
-                 "codec. Did you "
-                 "init player?");
 
-        // critical error
-        esp_restart();
+      if (chkInFrames != scSet->chkInFrames) {
+        if (player_send_snapcast_setting(scSet) != pdPASS) {
+          ESP_LOGE(TAG,
+                   "Failed to notify "
+                   "sync task about "
+                   "codec. Did you "
+                   "init player?");
+
+          // critical error
+          esp_restart();
+        }
+        chkInFrames = scSet->chkInFrames;
       }
 
 #if CONFIG_USE_DSP_PROCESSOR
       if ((*pcmData) && ((*pcmData)->fragment->payload)) {
-        dsp_processor_worker((void *)(*pcmData), (void *)scSet);
+        dsp_processor_worker((*pcmData)->fragment->payload,
+            (*pcmData)->fragment->size / ((scSet->bits / 8) * scSet->ch),
+            scSet->sr, scSet->ch);
       }
 #endif
       if (*pcmData) {
@@ -1115,7 +1136,7 @@ int process_data(snapcast_protocol_parser_t *parser,
       if (parse_wire_chunk_message(parser, &base_message_rx, *codec, pcmData, &wire_chnk, &decoderChunk) != PARSER_OK) {
         return -1;
       }
-      handle_chunk_message(*codec, scSet, pcmData, &wire_chnk);
+      handle_chunk_message(*codec, &(scSet->playerSetting), pcmData, &wire_chnk);
       return 0;
     }
 
@@ -1126,7 +1147,7 @@ int process_data(snapcast_protocol_parser_t *parser,
       if (parse_codec_header_message(parser, received_codec_header, codec, &codecPayload, &codecPayloadLen) != PARSER_OK) {
         return_value = -1;
       } else {
-        codec_header_received(codecPayload, codecPayloadLen, *codec, scSet, time_sync_data);
+        codec_header_received(codecPayload, codecPayloadLen, *codec, &(scSet->playerSetting), time_sync_data);
       }
 
       // in all cases: free Payload
@@ -1368,12 +1389,11 @@ static void http_get_task(void *pvParameters) {
     hello_message_serialized = NULL;
 
     // init default setting
-    scSet.buf_ms = 500;
-    scSet.codec = NONE;
-    scSet.bits = 16;
-    scSet.ch = 2;
-    scSet.sr = 44100;
-    scSet.chkInFrames = 0;
+    scSet.playerSetting.buf_ms = 0;
+    scSet.playerSetting.bits = 16;
+    scSet.playerSetting.ch = 2;
+    scSet.playerSetting.sr = 44100;
+    scSet.playerSetting.chkInFrames = 0;
     scSet.muted = true;
 
     snapcast_protocol_parser_t parser;
