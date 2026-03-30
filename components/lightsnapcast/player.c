@@ -106,9 +106,7 @@ static QueueHandle_t snapcastSettingQueueHandle = NULL;
 
 static uint32_t i2sDmaBufCnt;
 static uint32_t i2sDmaBufMaxLen;
-
-static SemaphoreHandle_t snapcastSettingsMux = NULL;
-static snapcastSetting_t currentSnapcastSetting;
+static playerSetting_t *scSet;  // should be used only from http_task
 
 static void tg0_timer_init(void);
 static void tg0_timer_deinit(void);
@@ -118,7 +116,6 @@ static bool gpTimerRunning = false;
 static void player_task(void *pvParameters);
 
 //player state
-bool gotSettings = false;
 bool playerStarted = false;
 bool playerPaused = false;
 static SemaphoreHandle_t playerStateMux = NULL;
@@ -215,7 +212,7 @@ static void ensure_noiseless(i2s_chan_handle_t tx) {
 /**
  *
  */
-static esp_err_t player_setup_i2s(snapcastSetting_t *setting, bool lock) {
+static esp_err_t player_setup_i2s(playerSetting_t *setting, bool lock) {
 
   if (lock_i2s != NULL && lock) {
     if (lock_i2s(true, pdMS_TO_TICKS(10)) != pdTRUE) {
@@ -434,9 +431,10 @@ int deinit_player(void) {
     vSemaphoreDelete(playerStateMux);
     playerStateMux = NULL;
   }
-  if (snapcastSettingsMux != NULL) {
-    vSemaphoreDelete(snapcastSettingsMux);
-    snapcastSettingsMux = NULL;
+  if (snapcastSettingQueueHandle != NULL) {
+    // delete the queue
+    vQueueDelete(snapcastSettingQueueHandle);
+    snapcastSettingQueueHandle = NULL;
   }
   ret = destroy_pcm_queue(&pcmChkQHdl);
 
@@ -465,15 +463,24 @@ int deinit_player(void) {
   return ret;
 }
 
+void call_state_cb(void) {
+  if (state_cb != NULL) {
+    xSemaphoreTake(playerStateMux, portMAX_DELAY);
+    bool paused = playerPaused;
+    xSemaphoreGive(playerStateMux);
+    state_cb(paused);
+  }
+}
+
 /**
  *  call before http task creation!
  */
 int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*set_mute_cb)(bool), void (*cb)(bool), bool (*lock)(bool, TickType_t)) {
-  int ret = 0;
   if (set_mute_cb == NULL) {
     ESP_LOGE(TAG, "set_mute_cb is NULL");
     return -1;
   }
+   
   audio_set_mute = set_mute_cb;
   state_cb = cb; // can be NULL
   lock_i2s = lock; // can be NULL
@@ -484,30 +491,13 @@ int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*s
   pin_config0 = pin_config0_;
   i2sNum = i2sNum_;
 
-  currentSnapcastSetting.buf_ms = 0;
-  currentSnapcastSetting.chkInFrames = 0;
-  currentSnapcastSetting.codec = NONE;
-  currentSnapcastSetting.sr = 0;
-  currentSnapcastSetting.ch = 0;
-  currentSnapcastSetting.bits = 0;
-
-  if (snapcastSettingsMux == NULL) {
-    snapcastSettingsMux = xSemaphoreCreateMutex();
-    xSemaphoreGive(snapcastSettingsMux);
-  }
+  // create message queue to inform task of changed settings
+  snapcastSettingQueueHandle = xQueueCreate(1, sizeof(playerSetting_t));
 
   if (playerStateMux == NULL) {
     playerStateMux = xSemaphoreCreateMutex();
     xSemaphoreGive(playerStateMux);
   }
-
-  /**
-  ret = player_setup_i2s(&currentSnapcastSetting);
-  if (ret < 0) {
-    ESP_LOGE(TAG, "player_setup_i2s failed: %d", ret);
-
-    return -1;
-  }*/
 
   // create semaphore for time diff buffer to server
   if (latencyBufSemaphoreHandle == NULL) {
@@ -549,7 +539,7 @@ int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*s
 /**
  * call to start the player task
  */
-int start_player(snapcastSetting_t *setting) {
+int start_player() {
   if (xSemaphoreTake(playerStateMux, 0) != pdTRUE) {
     // shutdown in progress, don't start player
     return -1;
@@ -558,10 +548,14 @@ int start_player(snapcastSetting_t *setting) {
       xSemaphoreGive(playerStateMux);
       return -1;
   }
+  if (scSet == NULL || !(( scSet->buf_ms > 0) && (scSet->chkInFrames > 0))) {
+      xSemaphoreGive(playerStateMux);
+      return -1;
+  }
   playerStarted = true;
   int ret = 0;
 
-  ret = player_setup_i2s(setting, true);
+  ret = player_setup_i2s(scSet, true);
   if (ret < 0) {
     ESP_LOGE(TAG, "player_setup_i2s failed: %d", ret);
     playerStarted = false;
@@ -582,27 +576,15 @@ int start_player(snapcastSetting_t *setting) {
   esp_pm_lock_acquire(player_pm_lock_handle);
 #endif
   
-  // create message queue to inform task of changed settings
-  snapcastSettingQueueHandle = xQueueCreate(1, sizeof(uint8_t));
-  
   if (pcmChkQHdl == NULL) 
   {
-    snapcastSetting_t scSet;
-    memset(&scSet, 0, sizeof(snapcastSetting_t));
-    player_get_snapcast_settings(&scSet);
     
-    // ensure we don't have a divide by zero situation
-    uint32_t chkInFrames = scSet.chkInFrames;
-    if (chkInFrames == 0) {
-      chkInFrames = 1152; // choose a good default for now
-    }
-    
-    int entries = ceil(((float)scSet.sr / (float)chkInFrames) *
-                        ((float)scSet.buf_ms / 1000));
+    int entries = ceil(((float)scSet->sr / (float)scSet->chkInFrames) *
+                        ((float)scSet->buf_ms / 1000));
 
     // some chunks are placed in DMA buffer
     // so we can save a little RAM here
-    entries -= ((i2sDmaBufMaxLen * i2sDmaBufCnt) / chkInFrames);
+    entries -= ((i2sDmaBufMaxLen * i2sDmaBufCnt) / scSet->chkInFrames);
 
     pcmChkQHdl = xQueueCreate(entries, sizeof(pcm_chunk_message_t *));
 
@@ -611,7 +593,7 @@ int start_player(snapcastSetting_t *setting) {
 
   ESP_LOGI(TAG, "Start player_task");
 
-  xTaskCreatePinnedToCore(player_task, "player", 1024 * 3, NULL,
+  xTaskCreatePinnedToCore(player_task, "player", 1024 * 3, (void*) scSet,
                           SYNC_TASK_PRIORITY, &playerTaskHandle,
                           SYNC_TASK_CORE_ID);
 
@@ -635,45 +617,6 @@ void pause_player(bool pause) {
   } else {
     xSemaphoreGive(playerStateMux);
   }
-}
-
-void call_state_cb(void) {
-  if (state_cb != NULL) {
-    xSemaphoreTake(playerStateMux, portMAX_DELAY);
-    bool paused = playerPaused;
-    xSemaphoreGive(playerStateMux);
-    state_cb(paused);
-  }
-}
-
-/**
- *
- */
-int8_t player_set_snapcast_settings(snapcastSetting_t *setting) {
-  int8_t ret = pdPASS;
-
-  xSemaphoreTake(snapcastSettingsMux, portMAX_DELAY);
-
-  memcpy(&currentSnapcastSetting, setting, sizeof(snapcastSetting_t));
-
-  xSemaphoreGive(snapcastSettingsMux);
-
-  return ret;
-}
-
-/**
- *
- */
-int8_t player_get_snapcast_settings(snapcastSetting_t *setting) {
-  int8_t ret = pdPASS;
-
-  xSemaphoreTake(snapcastSettingsMux, portMAX_DELAY);
-
-  memcpy(setting, &currentSnapcastSetting, sizeof(snapcastSetting_t));
-
-  xSemaphoreGive(snapcastSettingsMux);
-
-  return ret;
 }
 
 #if USE_TIMEFILTER
@@ -737,42 +680,23 @@ int32_t player_latency_insert(int64_t newValue) {
 /**
  *
  */
-int32_t player_send_snapcast_setting(snapcastSetting_t *setting) {
+int32_t player_send_snapcast_setting(playerSetting_t *setting) {
   int ret;
-  snapcastSetting_t curSet;
-  uint8_t settingChanged = 1;
 
-  ret = player_get_snapcast_settings(&curSet);
-
-  if ((curSet.bits != setting->bits) || (curSet.buf_ms != setting->buf_ms) ||
-      (curSet.ch != setting->ch) ||
-      (curSet.chkInFrames != setting->chkInFrames) ||
-      (curSet.codec != setting->codec) || (curSet.sr != setting->sr) ||
-      (curSet.cDacLat_ms != setting->cDacLat_ms)) {
-    ret = player_set_snapcast_settings(setting);
+  if ((playerTaskHandle != NULL) && (snapcastSettingQueueHandle != NULL)) {
+    ret = xQueueOverwrite(snapcastSettingQueueHandle, setting);
     if (ret != pdPASS) {
       ESP_LOGE(TAG,
-               "player_send_snapcast_setting: couldn't change "
-               "snapcast setting");
+                "player_send_snapcast_setting: couldn't notify "
+                "snapcast setting");
+    } else {
+                ESP_LOGI(TAG,
+                "got settings and notified player_task");
     }
-
-    // notify needed
-    if ((playerTaskHandle != NULL) && (snapcastSettingQueueHandle != NULL)) {
-      ret = xQueueOverwrite(snapcastSettingQueueHandle, &settingChanged);
-      if (ret != pdPASS) {
-        ESP_LOGE(TAG,
-                  "player_send_snapcast_setting: couldn't notify "
-                  "snapcast setting");
-      } else {
-                  ESP_LOGI(TAG,
-                  "got settings and notified player_task");
-      }
-    }
-  }
-
-  if (!gotSettings && (setting->bits > 0) && ( setting->buf_ms > 0) && (setting->ch > 0) && 
-      (setting->chkInFrames > 0) && (setting->sr > 0)) {
-    gotSettings = true;
+  } else if (scSet == NULL) {
+    scSet = setting;
+    ESP_LOGI(TAG,
+                "got initial settings");
   }
 
   return pdPASS;
@@ -1416,14 +1340,8 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
   }
   if (pcmChkQHdl == NULL) {
     ESP_LOGW(TAG, "pcm chunk queue not created. Player started: %s", playerStarted ? "True": "False");
-
     free_pcm_chunk(pcmChunk);
-
-    snapcastSetting_t curSet;
-    player_get_snapcast_settings(&curSet);
-    if (gotSettings) {
-        start_player(&curSet);
-    }
+    start_player();
 
     return -2;
   }
@@ -1485,8 +1403,7 @@ static void player_task(void *pvParameters) {
   char *p_payload = NULL;
   size_t size = 0;
   uint32_t notifiedValue;
-  snapcastSetting_t scSet;
-  uint8_t scSetChgd = 0;
+  playerSetting_t scSet;
   uint64_t timer_val;
   int initialSync = 0;
   int dir = 0;
@@ -1505,8 +1422,7 @@ static void player_task(void *pvParameters) {
   uint64_t samples_written = 0;  
   UBaseType_t uxHighWaterMark;
 
-  memset(&scSet, 0, sizeof(snapcastSetting_t));
-  player_get_snapcast_settings(&scSet);
+  memcpy(&scSet, (playerSetting_t*)pvParameters, sizeof(playerSetting_t));
 
   ESP_LOGI(TAG, "started sync task");
 
@@ -1566,11 +1482,9 @@ static void player_task(void *pvParameters) {
 
     // check if we got changed setting available, if so we need to
     // reinitialize
-    ret = xQueueReceive(snapcastSettingQueueHandle, &scSetChgd, 0);
+    playerSetting_t __scSet;
+    ret = xQueueReceive(snapcastSettingQueueHandle, &__scSet, 0);
     if (ret == pdTRUE) {
-      snapcastSetting_t __scSet;
-
-      player_get_snapcast_settings(&__scSet);
 
       if ((__scSet.buf_ms > 0) && (__scSet.chkInFrames > 0) &&
           (__scSet.sr > 0)) {
@@ -1580,6 +1494,8 @@ static void player_task(void *pvParameters) {
 
         if ((scSet.sr != __scSet.sr) || (scSet.bits != __scSet.bits) ||
             (scSet.ch != __scSet.ch)) {
+          ESP_LOGI(TAG, "reinitializing i2s with new settings: sample rate %ld, ch %d, bits %d",
+                   __scSet.sr, __scSet.ch, __scSet.bits);
           my_i2s_channel_enable(tx_chan);
           audio_set_mute(true);
           my_i2s_channel_disable(tx_chan);
@@ -2179,11 +2095,6 @@ static void player_task(void *pvParameters) {
     lock_i2s(false, 0);
   }
   xSemaphoreTake(playerStateMux, portMAX_DELAY);
-  xSemaphoreTake(snapcastSettingsMux, portMAX_DELAY);
-  // delete the queue
-  vQueueDelete(snapcastSettingQueueHandle);
-  snapcastSettingQueueHandle = NULL;
-  xSemaphoreGive(snapcastSettingsMux);
 
 #if CONFIG_PM_ENABLE
   esp_pm_lock_release(player_pm_lock_handle);
