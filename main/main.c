@@ -1662,6 +1662,13 @@ void app_main(void) {
   gpio_config(&cfg);
 #endif
 
+  // Initialize settings manager (hostname + snapserver settings)
+  settings_manager_init();
+
+  // Initialize network events (must be before network_if_init)
+  network_events_init();
+
+  // Initialize network interfaces (reads settings during startup)
   network_if_init();
 
   board_i2s_pin_t pin_config0;
@@ -1793,15 +1800,6 @@ void app_main(void) {
   }
   #endif
 
-  // Initialize settings manager (hostname + snapserver settings)
-  settings_manager_init();
-
-  // Initialize network events (must be before network_if_init)
-  network_events_init();
-
-  // Initialize network interfaces (reads settings during startup)
-  network_if_init();
-  
   // Get hostname for mDNS
   char mdns_hostname[64] = {0};
   if (settings_get_hostname(mdns_hostname, sizeof(mdns_hostname)) != ESP_OK) {
