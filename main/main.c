@@ -33,6 +33,8 @@
 #include "network_interface.h"
 #include "nvs_flash.h"
 
+#include "esp32_udp_logger.h"
+
 // Web socket server
 // #include "websocket_if.h"
 // #include "websocket_server.h"
@@ -79,7 +81,7 @@ static void error_callback(const FLAC__StreamDecoder *decoder,
 
 static FLAC__StreamDecoder *flacDecoder = NULL;
 
-const char *VERSION_STRING = "0.0.3";
+const char *VERSION_STRING = "0.0.4";
 
 #define HTTP_TASK_PRIORITY 17
 #define HTTP_TASK_CORE_ID 1
@@ -105,8 +107,15 @@ static const char *TAG = "SC";
 // static QueueHandle_t playerChunkQueueHandle = NULL;
 SemaphoreHandle_t timeSyncSemaphoreHandle = NULL;
 
-SemaphoreHandle_t idCounterSemaphoreHandle = NULL;
-SemaphoreHandle_t playerStateChangedMutex = NULL;
+static SemaphoreHandle_t idCounterSemaphoreHandle = NULL;
+static SemaphoreHandle_t snapcastStateChangedMutex = NULL;
+
+typedef struct snapcastSetting_s {
+  playerSetting_t playerSetting;
+
+  bool muted;
+  uint32_t volume;
+} snapcastSetting_t;
 
 typedef struct audioDACdata_s {
   bool playerMute;
@@ -118,7 +127,9 @@ static audioDACdata_t audioDAC_data;
 static QueueHandle_t audioDACQHdl = NULL;
 static SemaphoreHandle_t audioDACSemaphore = NULL;
 static void (*set_volume_cb)(int volume);
-static void (*set_mute_cb)(bool mute);
+static void (*set_mute_cb)(bool mute, bool state);
+static SemaphoreHandle_t snapcastStateMux = NULL;
+static SemaphoreHandle_t i2sLockMutex = NULL;
 
 void time_sync_msg_cb(void *args);
 
@@ -314,10 +325,10 @@ void time_sync_msg_received(base_message_t *base_message_rx,
 static FLAC__StreamDecoderReadStatus read_callback(
     const FLAC__StreamDecoder *decoder, FLAC__byte buffer[], size_t *bytes,
     void *client_data) {
-  snapcastSetting_t *scSet = (snapcastSetting_t *)client_data;
+  //snapcastSetting_t *scSet = (snapcastSetting_t *)client_data;
   //  decoderData_t *flacData;
 
-  (void)scSet;
+  //(void)scSet;
 
   // xQueueReceive(decoderReadQHdl, &flacData, portMAX_DELAY);
   // if (xQueueReceive(decoderReadQHdl, &flacData, pdMS_TO_TICKS(100)))
@@ -383,7 +394,7 @@ static FLAC__StreamDecoderWriteStatus write_callback(
     const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
     const FLAC__int32 *const buffer[], void *client_data) {
   size_t i;
-  snapcastSetting_t *scSet = (snapcastSetting_t *)client_data;
+  playerSetting_t *scSet = (playerSetting_t *)client_data;
 
   size_t bytes = frame->header.blocksize * frame->header.channels *
                  frame->header.bits_per_sample / 8;
@@ -470,7 +481,7 @@ static FLAC__StreamDecoderWriteStatus write_callback(
 void metadata_callback(const FLAC__StreamDecoder *decoder,
                        const FLAC__StreamMetadata *metadata,
                        void *client_data) {
-  snapcastSetting_t *scSet = (snapcastSetting_t *)client_data;
+  playerSetting_t *scSet = (playerSetting_t *)client_data;
 
   (void)decoder;
 
@@ -500,35 +511,97 @@ void error_callback(const FLAC__StreamDecoder *decoder,
            FLAC__StreamDecoderErrorStatusString[status]);
 }
 
+typedef enum { STOPPED = 0, IDLE, PLAYING, PAUSED } snapcast_state_t; //defined in player.h
+typedef enum { STOP = 0, START, RESTART, PAUSE, UNPAUSE } snapcast_commands_t;
+
+typedef struct state_cb_s {
+  void (*cb)(void);
+  struct state_cb_s *next;
+} state_cb_t;
+
+static snapcast_state_t sc_state = STOPPED;
+static state_cb_t *state_cb_head = NULL;
+
+void player_set_mute(bool mute) {
+  set_mute_cb(mute, false);
+}
+
+void set_mute_state(bool mute) {
+  set_mute_cb(mute, true);
+}
+
+void sc_send_command(snapcast_commands_t command) {
+  if (t_http_get_task != NULL) {
+    xTaskNotify(t_http_get_task, (uint32_t) command, eSetValueWithOverwrite);
+  }
+}
+
+void player_state_paused(bool paused) {
+  if (paused) {
+    sc_send_command(PAUSE);
+  } else {
+    sc_send_command(UNPAUSE);
+  }
+}
+
+void sc_start_snapcast() {
+  sc_send_command(START);
+}
+
+void sc_restart_snapcast() {
+  sc_send_command(RESTART);
+}
+
+void sc_stop_snapcast() {
+  sc_send_command(STOP);
+}
+
+void sc_pause_snapcast(bool pause) {
+  pause_player(pause);
+    if (!pause) {
+      //sc_send_command(UNPAUSE);
+    }
+}
+
+snapcast_state_t sc_get_snapcast_state(void) {
+  xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+  snapcast_state_t state = sc_state;
+  xSemaphoreGive(snapcastStateMux);
+  return state;
+}
+
+void sc_call_state_cb(void) {
+  state_cb_t *current = state_cb_head;
+  while (current != NULL) {
+    if (current->cb != NULL) {
+      current->cb();
+    }
+    current = current->next;
+  }
+}
+
 /**
- *
+ * add callback to be called when snapcast state changes, e.g. from not started to started.
+ * Callbacks needs to be implemented thread safe as they will be called from http task
  */
-int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool)) {
-  if (set_volume == NULL) {
-    ESP_LOGE(TAG, "Volume callback is NULL");
-
-    return -1;
+void sc_add_state_cb(void (*cb)()) {
+  state_cb_t *new_cb = malloc(sizeof(state_cb_t));
+  if (new_cb == NULL) {
+    ESP_LOGE(TAG, "Failed to allocate memory for state callback");
+    return;
   }
-  if (set_mute == NULL) {
-    ESP_LOGE(TAG, "Mute callback is NULL");
-
-    return -1;
-  }
-  set_volume_cb = set_volume;
-  set_mute_cb = set_mute;
-
-  return 0;
+  new_cb->cb = cb;
+  new_cb->next = state_cb_head;
+  state_cb_head = new_cb;
 }
 
 
-
 /**
  *
  */
-int server_settings_msg_received(
+void server_settings_msg_received(
     server_settings_message_t *server_settings_message,
-    snapcastSetting_t *scSet) {
-  static int volume = 0;
+    snapcastSetting_t *scSet, bool playing) {
   // log mute state, buffer, latency
   ESP_LOGI(TAG, "Buffer length:  %ld", server_settings_message->buffer_ms);
   ESP_LOGI(TAG, "Latency:        %ld", server_settings_message->latency);
@@ -537,7 +610,7 @@ int server_settings_msg_received(
 
   // Volume setting using ADF HAL
   // abstraction
-  if (scSet->muted != server_settings_message->muted) {
+  if (playing && scSet->muted != server_settings_message->muted) {
 #if SNAPCAST_USE_SOFT_VOL
     if (server_settings_message->muted) {
       dsp_processor_set_volome(0.0);
@@ -545,10 +618,10 @@ int server_settings_msg_received(
       dsp_processor_set_volome((double)server_settings_message->volume / 100);
     }
 #endif
-    set_mute_cb(server_settings_message->muted);
+    set_mute_state(server_settings_message->muted);
   }
 
-  if (volume != server_settings_message->volume) {
+  if (playing && scSet->volume != server_settings_message->volume) {
 #if SNAPCAST_USE_SOFT_VOL
     if (!server_settings_message->muted) {
       dsp_processor_set_volome((double)server_settings_message->volume / 100);
@@ -559,30 +632,30 @@ int server_settings_msg_received(
   }
 
   scSet->muted = server_settings_message->muted;
-  volume = server_settings_message->volume;
+  scSet->volume = server_settings_message->volume;
 
-  if (scSet->cDacLat_ms != server_settings_message->latency ||
-      scSet->buf_ms != server_settings_message->buffer_ms) {
-    scSet->cDacLat_ms = server_settings_message->latency;
-    scSet->buf_ms = server_settings_message->buffer_ms;
+  if (scSet->playerSetting.cDacLat_ms != server_settings_message->latency ||
+      scSet->playerSetting.buf_ms != server_settings_message->buffer_ms) {
+    scSet->playerSetting.cDacLat_ms = server_settings_message->latency;
+    scSet->playerSetting.buf_ms = server_settings_message->buffer_ms;
 
-    if (player_send_snapcast_setting(scSet) != pdPASS) {
+    if (playing && player_send_snapcast_setting(&(scSet->playerSetting)) != pdPASS) {
       ESP_LOGE(TAG,
                "Failed to notify sync task. "
                "Did you init player?");
 
-    return -1;  // fatal, this triggers return from http_get_task
+      // critical error
+      esp_restart();
     }
   }
-  return 0;
 }
 
 /**
  *
  */
-int codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
-                          codec_type_t codec, snapcastSetting_t *scSet,
-                          time_sync_data_t *time_sync_data) {
+void codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
+                           codec_type_t codec, playerSetting_t *scSet,
+                           time_sync_data_t *time_sync_data) {
   // first ensure everything is set up
   // correctly and resources are
   // available
@@ -607,7 +680,6 @@ int codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
     memcpy(&bits, codecPayload + 8, sizeof(bits));
     memcpy(&channels, codecPayload + 10, sizeof(channels));
 
-    scSet->codec = codec;
     scSet->bits = bits;
     scSet->ch = channels;
     scSet->sr = rate;
@@ -619,7 +691,8 @@ int codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
     opusDecoder = opus_decoder_create(scSet->sr, scSet->ch, &error);
     if (error != 0) {
       ESP_LOGI(TAG, "Failed to init opus coder");
-      return -1;
+      //critical error
+      esp_restart();
     }
 
     ESP_LOGI(TAG, "Initialized opus Decoder: %d", error);
@@ -636,7 +709,8 @@ int codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
     flacDecoder = FLAC__stream_decoder_new();
     if (flacDecoder == NULL) {
       ESP_LOGE(TAG, "Failed to init flac decoder");
-      return -1;
+      //critical error
+      esp_restart();
     }
 
     FLAC__StreamDecoderInitStatus init_status =
@@ -647,7 +721,8 @@ int codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
       ESP_LOGE(TAG, "ERROR: initializing decoder: %s\n",
                FLAC__StreamDecoderInitStatusString[init_status]);
 
-      return -1;
+      //critical error
+      esp_restart();
     }
 
     FLAC__stream_decoder_process_until_end_of_metadata(flacDecoder);
@@ -663,7 +738,6 @@ int codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
     memcpy(&rate, codecPayload + 24, sizeof(rate));
     memcpy(&bits, codecPayload + 34, sizeof(bits));
 
-    scSet->codec = codec;
     scSet->bits = bits;
     scSet->ch = channels;
     scSet->sr = rate;
@@ -676,7 +750,8 @@ int codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
              "shouldn't get here after "
              "codec string was detected");
 
-    return -1;
+    //critical error
+    esp_restart();
   }
 
   if (player_send_snapcast_setting(scSet) != pdPASS) {
@@ -684,7 +759,8 @@ int codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
              "Failed to notify sync task. "
              "Did you init player?");
 
-    return -1;
+    //critical error
+    esp_restart();
   }
 
   // ESP_LOGI(TAG, "done codec header msg");
@@ -694,15 +770,15 @@ int codec_header_received(char *codecPayload, uint32_t codecPayloadLen,
   //   esp_timer_start_periodic(time_sync_data->timeSyncMessageTimer,
   //                            time_sync_data->timeout);
   // }
-  return 0;
 }
 
 /**
  *
  */
-int handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
-                         pcm_chunk_message_t **pcmData,
-                         wire_chunk_message_t *wire_chnk) {
+void handle_chunk_message(codec_type_t codec, playerSetting_t *scSet,
+                          pcm_chunk_message_t **pcmData,
+                          wire_chunk_message_t *wire_chnk) {
+  static uint32_t chkInFrames = 0;
   switch (codec) {
     case OPUS: {
       int frame_size = -1;
@@ -758,6 +834,20 @@ int handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
 
       // ESP_LOGW(TAG, "OPUS decode: %d", frame_size);
 
+      if (chkInFrames != scSet->chkInFrames) {
+        if (player_send_snapcast_setting(scSet) != pdPASS) {
+          ESP_LOGE(TAG,
+                   "Failed to notify "
+                   "sync task about "
+                   "codec. Did you "
+                   "init player?");
+
+          // critical error
+          esp_restart();
+        }
+        chkInFrames = scSet->chkInFrames;
+      }
+
       if (allocate_pcm_chunk_memory(&new_pcmChunk, bytes) < 0) {
         *pcmData = NULL;
       } else {
@@ -784,21 +874,13 @@ int handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
 
 #if CONFIG_USE_DSP_PROCESSOR
         if (new_pcmChunk->fragment->payload) {
-          dsp_processor_worker((void *)new_pcmChunk, (void *)scSet);
+          dsp_processor_worker(new_pcmChunk->fragment->payload,
+            new_pcmChunk->fragment->size / ((scSet->bits / 8) * scSet->ch),
+            scSet->sr, scSet->ch);
         }
 #endif
 
         insert_pcm_chunk(new_pcmChunk);
-      }
-
-      if (player_send_snapcast_setting(scSet) != pdPASS) {
-        ESP_LOGE(TAG,
-                 "Failed to notify "
-                 "sync task about "
-                 "codec. Did you "
-                 "init player?");
-
-        return -1;
       }
 
       break;
@@ -844,6 +926,21 @@ int handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
       // ESP_LOGI(TAG, "new_pcmChunk with size %ld",
       // new_pcmChunk->totalSize);
 
+
+      if (chkInFrames != scSet->chkInFrames) {
+        if (player_send_snapcast_setting(scSet) != pdPASS) {
+          ESP_LOGE(TAG,
+                   "Failed to notify "
+                   "sync task about "
+                   "codec. Did you "
+                   "init player?");
+
+          // critical error
+          esp_restart();
+        }
+        chkInFrames = scSet->chkInFrames;
+      }
+
       if (ret == 0) {
         pcm_chunk_fragment_t *fragment = new_pcmChunk->fragment;
         uint32_t fragmentCnt = 0;
@@ -878,7 +975,9 @@ int handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
 
 #if CONFIG_USE_DSP_PROCESSOR
         if (new_pcmChunk->fragment->payload) {
-          dsp_processor_worker((void *)new_pcmChunk, (void *)scSet);
+          dsp_processor_worker(new_pcmChunk->fragment->payload,
+            new_pcmChunk->fragment->size / ((scSet->bits / 8) * scSet->ch),
+            scSet->sr, scSet->ch);
         }
 
 #endif
@@ -894,18 +993,6 @@ int handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
       free(pcmChunk.outData);
       pcmChunk.outData = NULL;
       pcmChunk.bytes = 0;
-
-      if (player_send_snapcast_setting(scSet) != pdPASS) {
-        ESP_LOGE(TAG,
-                 "Failed to "
-                 "notify "
-                 "sync task "
-                 "about "
-                 "codec. Did you "
-                 "init player?");
-
-        return -1;
-      }
 
       break;
     }
@@ -928,19 +1015,26 @@ int handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
       //          "got PCM decoded chunk size: %ld
       //          frames", scSet->chkInFrames);
 
-      if (player_send_snapcast_setting(scSet) != pdPASS) {
-        ESP_LOGE(TAG,
-                 "Failed to notify "
-                 "sync task about "
-                 "codec. Did you "
-                 "init player?");
 
-        return -1;
+      if (chkInFrames != scSet->chkInFrames) {
+        if (player_send_snapcast_setting(scSet) != pdPASS) {
+          ESP_LOGE(TAG,
+                   "Failed to notify "
+                   "sync task about "
+                   "codec. Did you "
+                   "init player?");
+
+          // critical error
+          esp_restart();
+        }
+        chkInFrames = scSet->chkInFrames;
       }
 
 #if CONFIG_USE_DSP_PROCESSOR
       if ((*pcmData) && ((*pcmData)->fragment->payload)) {
-        dsp_processor_worker((void *)(*pcmData), (void *)scSet);
+        dsp_processor_worker((*pcmData)->fragment->payload,
+            (*pcmData)->fragment->size / ((scSet->bits / 8) * scSet->ch),
+            scSet->sr, scSet->ch);
       }
 #endif
       if (*pcmData) {
@@ -955,103 +1049,106 @@ int handle_chunk_message(codec_type_t codec, snapcastSetting_t *scSet,
     }
 
     default: {
-      ESP_LOGE(TAG,
-               "Decoder (2) not "
-               "supported");
-
-      return -1;
+      // This should not happen, because codec header message should have been
+      // parsed before and codec should have been set to a supported value.
+      ESP_LOGE(TAG, "Decoder (2) not supported. This should never happen!");
+      // critical error
+      esp_restart();
 
       break;
     }
   }
-  return 0;
 }
+
+void update_state(bool *received_wire_chnk, bool *playback, bool paused) {
+  static int64_t last = 0;
+  static snapcast_state_t state = IDLE; //Todo
+  if ((paused || state != PLAYING) && (!paused || state != PAUSED) && *received_wire_chnk) {
+    xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+    if (paused) {
+      sc_state = PAUSED;
+      *playback = false;
+      ESP_LOGI(TAG, "Set paused");
+    }else{
+      sc_state = PLAYING;
+      ESP_LOGI(TAG, "Set playing");
+      *playback = true;
+    }
+    state = sc_state;
+    xSemaphoreGive(snapcastStateMux);
+    sc_call_state_cb();
+    last = esp_timer_get_time();
+    *received_wire_chnk = false;
+  }
+  else if (state == PLAYING || state == PAUSED) {
+    int64_t now = esp_timer_get_time();
+    if (now-last > 1000000) { //update once per sec
+      if (!(*received_wire_chnk)) {
+        xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+        sc_state = IDLE;
+        *playback = false;
+        state = sc_state;
+        xSemaphoreGive(snapcastStateMux);
+        sc_call_state_cb();
+      ESP_LOGI(TAG, "Set idle");
+      }
+      last = now;
+      *received_wire_chnk = false;
+    }
+  }
+  
+}
+
 
 /*
  * returns:
  * 0 if a message was (partially) processed sucessfully
- * -1 if a critial error occured
- * -2 if network needs restart
+ * -1 if network needs restart
  */
 int process_data(snapcast_protocol_parser_t *parser,
                  time_sync_data_t *time_sync_data, bool *received_codec_header,
                  codec_type_t *codec, snapcastSetting_t *scSet,
-                 pcm_chunk_message_t **pcmData, bool paused) {
+                 pcm_chunk_message_t **pcmData, bool *playback, bool paused) {
   base_message_t base_message_rx;
 
-  if (parse_base_message(parser, &base_message_rx) == PARSER_COMPLETE) {
-    time_sync_data->now = esp_timer_get_time();
-    base_message_rx.received.sec = time_sync_data->now / 1000000;
-    base_message_rx.received.usec =
-        time_sync_data->now - base_message_rx.received.sec * 1000000;
-  } else {  // PARSER_CONNECTION_ERROR (only these two cases for base message)
-    return -2;  // restart connection
+  static bool received_wire_chnk = false;
+  update_state(&received_wire_chnk, playback, paused);
+
+  if (parse_base_message(parser, &base_message_rx) != PARSER_OK) {
+    return -1;  // restart connection
   }
+  time_sync_data->now = esp_timer_get_time();
+  base_message_rx.received.sec = time_sync_data->now / 1000000;
+  base_message_rx.received.usec =
+      time_sync_data->now - base_message_rx.received.sec * 1000000;
 
   switch (base_message_rx.type) {
     case SNAPCAST_MESSAGE_WIRE_CHUNK: {
-      wire_chunk_message_t wire_chnk = {
-          {0, 0}, 0, NULL};  // is wire_chnk.payload ever used?
-      switch (parse_wire_chunk_message(parser, &base_message_rx,
-                                       *received_codec_header, *codec, pcmData,
-                                       &wire_chnk, &decoderChunk)) {
-        case PARSER_COMPLETE: {
-          if (paused) {
-            if (*pcmData != NULL) {
-              free_pcm_chunk(*pcmData);
-              *pcmData = NULL;
-            }
-            if (decoderChunk.inData != NULL) {
-              free(decoderChunk.inData);
-              decoderChunk.inData = NULL;
-            }
-            break;
-          }
-          if (handle_chunk_message(*codec, scSet, pcmData, &wire_chnk) != 0) {
-            return -1;
-          }
-          break;
-        }
-        case PARSER_CRITICAL_ERROR: {
+      wire_chunk_message_t wire_chnk = {{0, 0}, 0, NULL};  // is wire_chnk.payload ever used?
+      received_wire_chnk = true;
+      // skip this wires chunk message if codec header message was not received yet!
+      if (*received_codec_header == false || paused) {
+        if (parser_skip_typed_message(parser, &base_message_rx) != PARSER_OK) {
           return -1;
         }
-        case PARSER_INCOMPLETE: {
-          // need more data
-          return 0;
-        }
-        case PARSER_CONNECTION_ERROR: {
-          return -2;
-        }
+        return 0;
       }
-      break;
+
+      if (parse_wire_chunk_message(parser, &base_message_rx, *codec, pcmData, &wire_chnk, &decoderChunk) != PARSER_OK) {
+        return -1;
+      }
+      handle_chunk_message(*codec, &(scSet->playerSetting), pcmData, &wire_chnk);
+      return 0;
     }
 
     case SNAPCAST_MESSAGE_CODEC_HEADER: {
       char *codecPayload = NULL;
       uint32_t codecPayloadLen = 0;
       int return_value = 0;
-      switch (parse_codec_header_message(parser, received_codec_header, codec,
-                                         &codecPayload, &codecPayloadLen)) {
-        case PARSER_COMPLETE: {
-          if (codec_header_received(codecPayload, codecPayloadLen, *codec,
-                                    scSet, time_sync_data) != 0) {
-            return_value = -1;
-          }
-          break;
-        }
-        case PARSER_CRITICAL_ERROR: {
-          return_value = -1;
-          break;
-        }
-        case PARSER_CONNECTION_ERROR: {
-          return_value = -2;
-          break;
-        }
-        case PARSER_INCOMPLETE: {
-          // should not happen
-          // need more data
-          break;
-        }
+      if (parse_codec_header_message(parser, received_codec_header, codec, &codecPayload, &codecPayloadLen) != PARSER_OK) {
+        return_value = -1;
+      } else {
+        codec_header_received(codecPayload, codecPayloadLen, *codec, &(scSet->playerSetting), time_sync_data);
       }
 
       // in all cases: free Payload
@@ -1064,53 +1161,32 @@ int process_data(snapcast_protocol_parser_t *parser,
 
     case SNAPCAST_MESSAGE_SERVER_SETTINGS: {
       server_settings_message_t server_settings_message;
-      parser_return_state_t result = parse_sever_settings_message(
-          parser, &base_message_rx, &server_settings_message);
-      switch (result) {
-        case PARSER_COMPLETE: {
-          if (server_settings_msg_received(&server_settings_message, scSet) !=
-              0) {
-            return -1;
-          }
-          break;
-        }
-        case PARSER_CRITICAL_ERROR: {
-          return -1;
-        }
-        case PARSER_CONNECTION_ERROR: {
-          return -2;
-        }
-        case PARSER_INCOMPLETE: {
-          // should not happen
-          // need more data
-          break;
-        }
+      if (parse_sever_settings_message(parser, &base_message_rx, &server_settings_message) != PARSER_OK) {
+        return -1;
       }
-      break;
+      server_settings_msg_received(&server_settings_message, scSet, *playback);
+      return 0;
     }
 
     case SNAPCAST_MESSAGE_TIME: {
       time_message_t time_message_rx;
-      parser_return_state_t result =
-          parse_time_message(parser, &base_message_rx, &time_message_rx);
-      if (result == PARSER_COMPLETE) {
-        time_sync_msg_received(&base_message_rx, &time_message_rx,
-                               time_sync_data, *received_codec_header);
-      } else if (result == PARSER_CONNECTION_ERROR) {
-        return -2;
-      }  // could also be "incomplete", i.e. ignore content
-      break;
+      if (parse_time_message(parser, &base_message_rx, &time_message_rx) != PARSER_OK) {
+        return -1;
+      }
+      time_sync_msg_received(&base_message_rx, &time_message_rx, time_sync_data, *received_codec_header);
+      return 0;
     }
 
     default: {
-      if (parse_unknown_message(parser, &base_message_rx) ==
-          PARSER_CONNECTION_ERROR) {
-        return -2;
+      if (parser_skip_typed_message(parser, &base_message_rx) != PARSER_OK) {
+        return -1;
       }
-      break;
+
+      ESP_LOGI(TAG, "done skipping typed message %d", base_message_rx.type);
+      return 0;
     }
   }
-
+  // should never reach this
   return 0;
 }
 
@@ -1137,20 +1213,13 @@ void before_receive_callback(before_receive_callback_data_t *data) {
 }
 
 
-void network_playback_state_changed() {
-  player_state_e state = get_player_state();
+void network_state_cb(void) {
+  snapcast_state_t state = sc_get_snapcast_state();
   if (state == PLAYING || state == PAUSED) {
-    // Both PLAYING and PAUSED are active sessions - keep network up
     network_playback_started();
   } else {
-    // Only IDLE state means playback truly stopped
     network_playback_stopped();
   }
-}
-
-void http_player_state_changed() {
-  xTaskNotifyGive(t_http_get_task);
-  //ESP_LOGI(TAG, "http task cb");
 }
 
 /**
@@ -1174,7 +1243,9 @@ static void http_get_task(void *pvParameters) {
   codec_type_t codec = NONE;
   snapcastSetting_t scSet;
   pcm_chunk_message_t *pcmData = NULL;
+  uint32_t command = STOP;
   bool paused = false;
+  bool playback = false;
 
   // create a timer to send time sync messages every x µs
 //  esp_timer_create(&tSyncArgs, &time_sync_data.timeSyncMessageTimer);
@@ -1183,11 +1254,8 @@ static void http_get_task(void *pvParameters) {
   if (idCounterSemaphoreHandle == NULL) {
     ESP_LOGE(TAG, "can't create id Counter Semaphore");
 
-    return;
+    esp_restart();
   }
-
-  add_player_state_cb(http_player_state_changed);
-  add_player_state_cb(network_playback_state_changed);
 
   while (1) {
     // do some house keeping
@@ -1223,11 +1291,26 @@ static void http_get_task(void *pvParameters) {
     }
 
     // If a reconnect was requested but the inner loop exited via TCP error
-    // (-2) instead, the server still needs time to tear down the old session.
+    // instead, the server still needs time to tear down the old session.
     if (network_check_and_clear_reconnect()) {
       ESP_LOGD(TAG, "Pending reconnect; waiting 2s for server cleanup");
       vTaskDelay(pdMS_TO_TICKS(2000));
     }
+
+    // block if state = STOPPED
+    xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+    if (sc_state == STOPPED) {
+      xSemaphoreGive(snapcastStateMux);
+      command = STOP;
+      while(command != START) {
+        xTaskNotifyWait( 0, 0, &command, portMAX_DELAY);
+      }
+      xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+    }
+    sc_state = IDLE;
+    xSemaphoreGive(snapcastStateMux);
+    sc_call_state_cb();
+    playback = false;
 
     // NETWORK setup ends here ( or before getting mac address )
     setup_network(&connection.netif);
@@ -1301,7 +1384,8 @@ static void http_get_task(void *pvParameters) {
           &hello_message, (size_t *)&(base_message_rx.size));
       if (!hello_message_serialized) {
         ESP_LOGE(TAG, "Failed to serialize hello message");
-        return;
+        // critical error
+        esp_restart();
       }
     }
 
@@ -1309,7 +1393,8 @@ static void http_get_task(void *pvParameters) {
                                     BASE_MESSAGE_SIZE);
     if (result) {
       ESP_LOGE(TAG, "Failed to serialize base message");
-      return;
+      // critical error
+      esp_restart();
     }
 
     rc1 = netconn_write(lwipNetconn, base_message_serialized, BASE_MESSAGE_SIZE,
@@ -1328,12 +1413,11 @@ static void http_get_task(void *pvParameters) {
     hello_message_serialized = NULL;
 
     // init default setting
-    scSet.buf_ms = 500;
-    scSet.codec = NONE;
-    scSet.bits = 16;
-    scSet.ch = 2;
-    scSet.sr = 44100;
-    scSet.chkInFrames = 0;
+    scSet.playerSetting.buf_ms = 0;
+    scSet.playerSetting.bits = 16;
+    scSet.playerSetting.ch = 2;
+    scSet.playerSetting.sr = 44100;
+    scSet.playerSetting.chkInFrames = 0;
     scSet.muted = true;
 
     snapcast_protocol_parser_t parser;
@@ -1373,31 +1457,99 @@ static void http_get_task(void *pvParameters) {
       // Check if external module requested reconnect (e.g., ethernet takeover)
       if (network_check_and_clear_reconnect()) {
         ESP_LOGI(TAG, "Reconnect requested, closing connection");
-        if (lwipNetconn != NULL) {
-          netconn_close(lwipNetconn);
-          netconn_delete(lwipNetconn);
-          lwipNetconn = NULL;
-        }
+        netconn_close(lwipNetconn);
+        netconn_delete(lwipNetconn);
+        lwipNetconn = NULL;
         vTaskDelay(pdMS_TO_TICKS(2000));  // let server clean up
         break;
       }
 
-      if (ulTaskNotifyTake(pdTRUE, 1) != 0) {
-        // state change, e.g. pause/play
-        paused = get_player_state() == PAUSED;
+      bool restart = false;
+      static bool playback_old = false;
+      if (xTaskNotifyWait(0, 0, &command, 1) == pdTRUE) {
+        switch(command) {
+          case STOP:
+            xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+            sc_state = STOPPED;
+            xSemaphoreGive(snapcastStateMux);
+            sc_call_state_cb();
+          case RESTART:
+            restart = true;
+            break;
+          case UNPAUSE:
+            paused = false;
+            break;
+          case PAUSE:
+            paused = true;
+            break;
+          default:
+            break;
+        }
       //ESP_LOGI(TAG, "http got cb. %s", paused ? "paused" : "playing/idle");
       }
+      if (restart) {
+        //restart required
+        netconn_close(lwipNetconn);
+        netconn_delete(lwipNetconn);
+        lwipNetconn = NULL;
+        break; // restart connection
+      }
+
+      if (playback_old != playback) {
+        if (playback) {
+          // need to apply settings when starting to play
+#if SNAPCAST_USE_SOFT_VOL
+          if (!scSet.muted) {
+            dsp_processor_set_volome((double)scSet.volume / 100);
+          } else {
+            dsp_processor_set_volome(0.0);
+          }
+#else
+          set_volume_cb(scSet.volume);
+#endif
+          set_mute_state(scSet.muted);
+        }
+        playback_old = playback;
+      }
+
       int result =
           process_data(&parser, &time_sync_data, &received_codec_header, &codec,
-                       &scSet, &pcmData, paused);
-      if (result == -1) {
-        return;  // critical error in data processing
-      } else if (result == -2) {
+                       &scSet, &pcmData, &playback, paused);
+      if (result != 0) {
         break;  // restart connection
       }
     }
   }
 }
+
+/**
+ *
+ */
+int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool, bool), i2s_std_gpio_config_t i2s_pin_config0, i2s_port_t I2S_NUM_0, bool (*lock)(bool, TickType_t)) {
+  if (set_volume == NULL) {
+    ESP_LOGE(TAG, "Volume callback is NULL");
+
+    return -1;
+  }
+  if (set_mute == NULL) {
+    ESP_LOGE(TAG, "Mute callback is NULL");
+
+    return -1;
+  }
+  set_volume_cb = set_volume;
+  set_mute_cb = set_mute;
+  if (snapcastStateMux == NULL) {
+    snapcastStateMux = xSemaphoreCreateMutex();
+  }
+  init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute, player_state_paused, lock);
+
+  xTaskCreatePinnedToCore(&http_get_task, "http", 15 * 1024, NULL,
+                        HTTP_TASK_PRIORITY, &t_http_get_task,
+                        HTTP_TASK_CORE_ID);
+
+  return 0;
+}
+
 
 /**
  *
@@ -1444,14 +1596,6 @@ void audio_set_mute(bool mute, bool set_state) {
   xSemaphoreGive(audioDACSemaphore);
 }
 
-void player_set_mute(bool mute) {
-  audio_set_mute(mute, false);
-}
-
-void set_mute_state(bool mute) {
-  audio_set_mute(mute, true);
-}
-
 /**
  *
  */
@@ -1464,11 +1608,23 @@ void audio_set_volume(int volume) {
   xSemaphoreGive(audioDACSemaphore);
 }
 
-void player_state_changed() {
-  if (playerStateChangedMutex != NULL) {
-    xSemaphoreGive(playerStateChangedMutex);
+void sc_state_changed() {
+  if (snapcastStateChangedMutex != NULL) {
+    xSemaphoreGive(snapcastStateChangedMutex);
   }
   ESP_LOGI(TAG, "main task cb");
+}
+
+bool i2s_lock(bool lock, TickType_t wait) {
+  if (i2sLockMutex == NULL) {
+    return false;
+  }
+  if (lock) {
+    return xSemaphoreTake(i2sLockMutex, wait);
+  }
+  else {
+    return xSemaphoreGive(i2sLockMutex);
+  }
 }
 
 /**
@@ -1637,14 +1793,17 @@ void app_main(void) {
   audioDAC_data.playerMute = true;
   audioDAC_data.volume = -1;
 
-  init_snapcast(audio_set_volume, set_mute_state);
-  init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute);
-  add_player_state_cb(player_state_changed);
+  i2sLockMutex = xSemaphoreCreateBinary();
+
+  init_snapcast(audio_set_volume, audio_set_mute, i2s_pin_config0, I2S_NUM_0, i2s_lock);
+  //init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute);
+  sc_add_state_cb(sc_state_changed);
+  sc_add_state_cb(network_state_cb);
 
   // Create binary semaphore for player state change notification
-  playerStateChangedMutex = xSemaphoreCreateBinary();
-  if (playerStateChangedMutex == NULL) {
-    ESP_LOGE(TAG, "Failed to create playerStateChangedMutex");
+  snapcastStateChangedMutex = xSemaphoreCreateBinary();
+  if (snapcastStateChangedMutex == NULL) {
+    ESP_LOGE(TAG, "Failed to create snapcastStateChangedMutex");
     return;
   }
 
@@ -1670,6 +1829,11 @@ void app_main(void) {
     strncpy(mdns_hostname, "snapclient", sizeof(mdns_hostname) - 1);
   }
   ESP_LOGI(TAG, "Device hostname: %s", mdns_hostname);
+  
+  #if CONFIG_ESP32_UDP_LOGGER_ENABLED
+//  esp32_udp_logger_set_hostname(mdns_hostname);
+  esp32_udp_logger_autostart();
+  #endif
 
   init_http_server_task();
 
@@ -1689,10 +1853,7 @@ void app_main(void) {
 
   xTaskCreatePinnedToCore(&ota_server_task, "ota", 14 * 256, NULL,
                           OTA_TASK_PRIORITY, &t_ota_task, OTA_TASK_CORE_ID);
-
-  xTaskCreatePinnedToCore(&http_get_task, "http", 15 * 1024, NULL,
-                          HTTP_TASK_PRIORITY, &t_http_get_task,
-                          HTTP_TASK_CORE_ID);
+  sc_start_snapcast();
 
   //  while (1) {
   //    // audio_event_iface_msg_t msg;
@@ -1720,14 +1881,13 @@ void app_main(void) {
   esp_pm_configure(&pmConfig);
 #endif
   audioDACdata_t dac_data;
-  player_state_e state = IDLE;
-  int counter = 0;
+  snapcast_state_t state = IDLE;
   while (1) {
-    if (xQueueReceive(audioDACQHdl, &dac_data, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xQueueReceive(audioDACQHdl, &dac_data, pdMS_TO_TICKS(90)) == pdTRUE) {
       dac_control(board_handle, dac_data);
     }
-    if (xSemaphoreTake(playerStateChangedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      player_state_e state_new = get_player_state();
+    if (xSemaphoreTake(snapcastStateChangedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      snapcast_state_t state_new = sc_get_snapcast_state();
       ESP_LOGI(TAG, "main got cb: %d", state_new);
       if (state_new != state) {
         ESP_LOGI(TAG, "Player state changed: %d -> %d", state, state_new);
@@ -1743,11 +1903,5 @@ void app_main(void) {
         state = state_new;
       }
     }
-    // test pause/play toggle every 200 loops
-    // counter++;
-    // if (counter % 200 == 0) {
-    //   ESP_LOGI(TAG, "toggle pause: %d", state == PLAYING);
-    //   pause_player(state == PLAYING);
-    // }
   }
 }

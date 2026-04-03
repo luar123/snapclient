@@ -34,12 +34,6 @@ typedef struct dsp_all_params_s {
   } flow_params[DSP_FLOW_COUNT];
 } dsp_all_params_t;
 
-#ifdef CONFIG_USE_BIQUAD_ASM
-#define BIQUAD dsps_biquad_f32_ae32
-#else
-#define BIQUAD dsps_biquad_f32
-#endif
-
 static const char *TAG = "dsp_proc";
 
 #define DSP_PROCESSOR_LEN 16
@@ -265,21 +259,11 @@ static inline int16_t float_to_int16_clamped(float value) {
 /**
  *
  */
-int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
+int dsp_processor_worker(char *pcmChnk, uint16_t len, uint32_t samplerate, int ch) {
   ESP_LOGV(TAG, "%s: processing audio chunk", __func__);
-  const snapcastSetting_t *scSet = (const snapcastSetting_t *)p_scSet;
-  pcm_chunk_message_t *pcmChnk = (pcm_chunk_message_t *)p_pcmChnk;
-  uint32_t samplerate = scSet->sr;
 
-  if (!pcmChnk || !pcmChnk->fragment->payload) {
+  if (!pcmChnk) {
     return -1;
-  }
-
-  int bits = scSet->bits;
-  int ch = scSet->ch;
-
-  if (bits == 0) {
-    bits = 16;
   }
 
   if (ch == 0) {
@@ -291,12 +275,11 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
     ESP_LOGW(TAG, "%s: Sample rate is not set, using default: %lu", __func__, (unsigned long)samplerate);
   }
 
-  int16_t len = pcmChnk->fragment->size / ((bits / 8) * ch);
   int16_t valint;
   uint16_t i;
   // volatile needed to ensure 32 bit access
   volatile uint32_t *audio_tmp =
-      (volatile uint32_t *)(pcmChnk->fragment->payload);
+      (volatile uint32_t *)(pcmChnk);
   
   // Local working copy of filter parameters
   static filterParams_t currentFilterParams = {0};
@@ -521,9 +504,9 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
           }
 
           // BASS
-          BIQUAD(sbuffer0, sbufout0, max, filter[0].coeffs, filter[0].w);
+          dsps_biquad_f32(sbuffer0, sbufout0, max, filter[0].coeffs, filter[0].w);
           // TREBLE
-          BIQUAD(sbufout0, sbuffer0, max, filter[1].coeffs, filter[1].w);
+          dsps_biquad_f32(sbufout0, sbuffer0, max, filter[1].coeffs, filter[1].w);
 
           for (i = 0; i < max; i++) {
             valint = float_to_int16_clamped(sbuffer0[i]);
@@ -539,9 +522,9 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
           }
 
           // BASS
-          BIQUAD(sbuffer0, sbufout0, max, filter[2].coeffs, filter[2].w);
+          dsps_biquad_f32(sbuffer0, sbufout0, max, filter[2].coeffs, filter[2].w);
           // TREBLE
-          BIQUAD(sbufout0, sbuffer0, max, filter[3].coeffs, filter[3].w);
+          dsps_biquad_f32(sbufout0, sbuffer0, max, filter[3].coeffs, filter[3].w);
 
           for (i = 0; i < max; i++) {
             valint = float_to_int16_clamped(sbuffer0[i]);
@@ -597,7 +580,7 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
                 dynamic_vol * 
                 ((float)((int16_t)(tmp[i] & 0xFFFF))) / INT16_MAX;
           }
-          BIQUAD(sbuffer0, sbufout0, max, filter[0].coeffs, filter[0].w);
+          dsps_biquad_f32(sbuffer0, sbufout0, max, filter[0].coeffs, filter[0].w);
 
           for (i = 0; i < max; i++) {
             valint = float_to_int16_clamped(sbufout0[i]);
@@ -610,7 +593,7 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
                           ((float)((int16_t)((tmp[i] & 0xFFFF0000) >> 16))) /
                           INT16_MAX;
           }
-          BIQUAD(sbuffer0, sbufout0, max, filter[1].coeffs, filter[1].w);
+          dsps_biquad_f32(sbuffer0, sbufout0, max, filter[1].coeffs, filter[1].w);
 
           for (i = 0; i < max; i++) {
             valint = float_to_int16_clamped(sbufout0[i]);
@@ -636,8 +619,8 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
             sbuffer0[i] =
                 dynamic_vol * ((float)((int16_t)(tmp[i] & 0xFFFF))) / INT16_MAX;
           }
-          BIQUAD(sbuffer0, sbufout0, max, filter[0].coeffs, filter[0].w);
-          BIQUAD(sbufout0, sbuffer0, max, filter[1].coeffs, filter[1].w);
+          dsps_biquad_f32(sbuffer0, sbufout0, max, filter[0].coeffs, filter[0].w);
+          dsps_biquad_f32(sbufout0, sbuffer0, max, filter[1].coeffs, filter[1].w);
 
           for (i = 0; i < max; i++) {
             valint = float_to_int16_clamped(sbuffer0[i]);
@@ -650,8 +633,8 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
                           ((float)((int16_t)((tmp[i] & 0xFFFF0000) >> 16))) /
                           INT16_MAX;
           }
-          BIQUAD(sbuffer0, sbufout0, max, filter[2].coeffs, filter[2].w);
-          BIQUAD(sbufout0, sbuffer0, max, filter[3].coeffs, filter[3].w);
+          dsps_biquad_f32(sbuffer0, sbufout0, max, filter[2].coeffs, filter[2].w);
+          dsps_biquad_f32(sbufout0, sbuffer0, max, filter[3].coeffs, filter[3].w);
 
           for (i = 0; i < max; i++) {
             valint = float_to_int16_clamped(sbuffer0[i]);
@@ -664,16 +647,16 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
 
       case dspf2DOT1: {  // Process audio L + R LOW PASS FILTER
         /*
-           BIQUAD(sbuffer2, sbuftmp0, len, bq[0].coeffs, bq[0].w);
-           BIQUAD(sbuftmp0, sbufout2, len, bq[1].coeffs, bq[1].w);
+           dsps_biquad_f32(sbuffer2, sbuftmp0, len, bq[0].coeffs, bq[0].w);
+           dsps_biquad_f32(sbuftmp0, sbufout2, len, bq[1].coeffs, bq[1].w);
 
            // Process audio L HIGH PASS FILTER
-           BIQUAD(sbuffer0, sbuftmp0, len, bq[2].coeffs, bq[2].w);
-           BIQUAD(sbuftmp0, sbufout0, len, bq[3].coeffs, bq[3].w);
+           dsps_biquad_f32(sbuffer0, sbuftmp0, len, bq[2].coeffs, bq[2].w);
+           dsps_biquad_f32(sbuftmp0, sbufout0, len, bq[3].coeffs, bq[3].w);
 
            // Process audio R HIGH PASS FILTER
-           BIQUAD(sbuffer1, sbuftmp0, len, bq[4].coeffs, bq[4].w);
-           BIQUAD(sbuftmp0, sbufout1, len, bq[5].coeffs, bq[5].w);
+           dsps_biquad_f32(sbuffer1, sbuftmp0, len, bq[4].coeffs, bq[4].w);
+           dsps_biquad_f32(sbuftmp0, sbufout1, len, bq[5].coeffs, bq[5].w);
 
            int16_t valint[5];
            for (uint16_t i = 0; i < len; i++) {
@@ -703,16 +686,16 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
 
       case dspfFunkyHonda: {  // Process audio L + R LOW PASS FILTER
         /*
-          BIQUAD(sbuffer2, sbuftmp0, len, bq[0].coeffs, bq[0].w);
-          BIQUAD(sbuftmp0, sbufout2, len, bq[1].coeffs, bq[1].w);
+          dsps_biquad_f32(sbuffer2, sbuftmp0, len, bq[0].coeffs, bq[0].w);
+          dsps_biquad_f32(sbuftmp0, sbufout2, len, bq[1].coeffs, bq[1].w);
 
           // Process audio L HIGH PASS FILTER
-          BIQUAD(sbuffer0, sbuftmp0, len, bq[2].coeffs, bq[2].w);
-          BIQUAD(sbuftmp0, sbufout0, len, bq[3].coeffs, bq[3].w);
+          dsps_biquad_f32(sbuffer0, sbuftmp0, len, bq[2].coeffs, bq[2].w);
+          dsps_biquad_f32(sbuftmp0, sbufout0, len, bq[3].coeffs, bq[3].w);
 
           // Process audio R HIGH PASS FILTER
-          BIQUAD(sbuffer1, sbuftmp0, len, bq[4].coeffs, bq[4].w);
-          BIQUAD(sbuftmp0, sbufout1, len, bq[5].coeffs, bq[5].w);
+          dsps_biquad_f32(sbuffer1, sbuftmp0, len, bq[4].coeffs, bq[4].w);
+          dsps_biquad_f32(sbuftmp0, sbufout1, len, bq[5].coeffs, bq[5].w);
 
           uint16_t scale = 16384;  // INT16_MAX
           int16_t valint[5];
