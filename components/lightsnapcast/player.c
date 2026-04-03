@@ -493,6 +493,10 @@ int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*s
 
   // create message queue to inform task of changed settings
   snapcastSettingQueueHandle = xQueueCreate(1, sizeof(playerSetting_t));
+  if (snapcastSettingQueueHandle == NULL) {
+    ESP_LOGE(TAG, "Failed to create snapcast settings queue");
+    return -1;
+  }
 
   if (playerStateMux == NULL) {
     playerStateMux = xSemaphoreCreateMutex();
@@ -587,6 +591,11 @@ int start_player() {
     entries -= ((i2sDmaBufMaxLen * i2sDmaBufCnt) / scSet->chkInFrames);
 
     pcmChkQHdl = xQueueCreate(entries, sizeof(pcm_chunk_message_t *));
+    if (pcmChkQHdl == NULL) {
+      ESP_LOGE(TAG, "Failed to create pcm chunk queue (%d entries)", entries);
+      playerStarted = false;
+      return -1;
+    }
 
     ESP_LOGI(TAG, "created new queue with %d", entries);
   }
@@ -1535,6 +1544,9 @@ static void player_task(void *pvParameters) {
           queueCreatedWithChkInFrames = __scSet.chkInFrames;
 
           pcmChkQHdl = xQueueCreate(entries, sizeof(pcm_chunk_message_t *));
+          if (pcmChkQHdl == NULL) {
+            ESP_LOGE(TAG, "Failed to create pcm chunk queue (%d entries)", entries);
+          }
 
           ESP_LOGI(TAG, "created new queue with %d", entries);
         }

@@ -1295,13 +1295,6 @@ static void http_get_task(void *pvParameters) {
       }
     }
 
-    // If a reconnect was requested but the inner loop exited via TCP error
-    // instead, the server still needs time to tear down the old session.
-    if (network_check_and_clear_reconnect()) {
-      ESP_LOGI(TAG, "Pending reconnect; waiting 2s for server cleanup");
-      vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-
     // block if state = STOPPED
     xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
     if (sc_state == STOPPED) {
@@ -1452,52 +1445,16 @@ static void http_get_task(void *pvParameters) {
     netconn_set_recvtimeout(lwipNetconn, time_sync_data.timeout / 1000); // timeout in ms
 
 
-    // Drain any reconnect request that arrived while we were connecting
-    // (e.g., boot-time MAC unification fires reconnect during mDNS/TCP setup).
-    // No delay needed: no prior server session exists to clean up.
-    network_check_and_clear_reconnect();
-
     // Main connection loop - state machine + data processing
     paused = false;
     while (1) {
-      // Check if external module requested reconnect (e.g., ethernet takeover)
-      if (network_check_and_clear_reconnect()) {
-        ESP_LOGI(TAG, "Reconnect requested, closing connection");
-        netconn_close(lwipNetconn);
-        netconn_delete(lwipNetconn);
-        lwipNetconn = NULL;
-        vTaskDelay(pdMS_TO_TICKS(2000));  // let server clean up
-        break;
-      }
-
-      bool restart = false;
-      if (xTaskNotifyWait(0, 0, &command, 1) == pdTRUE) {
-        switch(command) {
-          case STOP:
-            xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
-            sc_state = STOPPED;
-            xSemaphoreGive(snapcastStateMux);
-            sc_call_state_cb();
-          case RESTART:
-            restart = true;
-            break;
-          case UNPAUSE:
-            paused = false;
-            break;
-          case PAUSE:
-            paused = true;
-            break;
-          default:
-            break;
-        }
-      //ESP_LOGI(TAG, "http got cb. %s", paused ? "paused" : "playing/idle");
-      }
-      if (restart) {
-        //restart required
-        netconn_close(lwipNetconn);
-        netconn_delete(lwipNetconn);
-        lwipNetconn = NULL;
-        break; // restart connection
+      // Process network data first — makes RESTART more responsive by
+      // handling it immediately after the blocking recv returns.
+      int result =
+          process_data(&parser, &time_sync_data, &received_codec_header, &codec,
+                       &scSet, &pcmData, &playback, paused);
+      if (result != 0) {
+        break;  // restart connection
       }
 
       if (playback_old != playback) {
@@ -1517,11 +1474,39 @@ static void http_get_task(void *pvParameters) {
         playback_old = playback;
       }
 
-      int result =
-          process_data(&parser, &time_sync_data, &received_codec_header, &codec,
-                       &scSet, &pcmData, &playback, paused);
-      if (result != 0) {
-        break;  // restart connection
+      bool restart = false;
+      if (xTaskNotifyWait(0, 0, &command, 1) == pdTRUE) {
+        switch(command) {
+          case STOP:
+            xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+            sc_state = STOPPED;
+            xSemaphoreGive(snapcastStateMux);
+            sc_call_state_cb();
+            /* fall through — STOP also needs to close the connection */
+          case RESTART:
+            restart = true;
+            break;
+          case UNPAUSE:
+            paused = false;
+            break;
+          case PAUSE:
+            paused = true;
+            break;
+          default:
+            break;
+        }
+      //ESP_LOGI(TAG, "http got cb. %s", paused ? "paused" : "playing/idle");
+      }
+      if (restart) {
+        //restart required
+        netconn_close(lwipNetconn);
+        netconn_delete(lwipNetconn);
+        lwipNetconn = NULL;
+        // Let server detect disconnect and clean up old session.
+        // Note: eth_interface.c's deferred takeover path waits 2500ms for this
+        // to complete before suppressing WiFi — keep this >= that expectation.
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        break; // restart connection
       }
     }
   }

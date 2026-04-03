@@ -41,7 +41,6 @@ static bool unified_mac_initialized = false;
 static SemaphoreHandle_t mac_mutex = NULL;
 
 /* ============ Event Group for Inter-Component Coordination ============ */
-#define EVENT_RECONNECT_REQUESTED_BIT  BIT0
 #define EVENT_PLAYBACK_STARTED_BIT     BIT1
 #define EVENT_PLAYBACK_STOPPED_BIT     BIT2
 /* BIT3 reserved for eth_interface.c monitor shutdown */
@@ -74,31 +73,6 @@ void network_events_deinit(void) {
 
 EventGroupHandle_t network_get_event_group(void) {
     return network_event_group;
-}
-
-esp_err_t network_request_reconnect(void) {
-    if (!network_event_group) {
-        ESP_LOGW(TAG, "network_request_reconnect: events not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-    ESP_LOGD(TAG, "Reconnect requested");
-    xEventGroupSetBits(network_event_group, EVENT_RECONNECT_REQUESTED_BIT);
-    return ESP_OK;
-}
-
-bool network_check_and_clear_reconnect(void) {
-    if (!network_event_group) {
-        return false;
-    }
-    // Atomic test-and-clear using WaitBits with 0 timeout
-    EventBits_t bits = xEventGroupWaitBits(
-        network_event_group,
-        EVENT_RECONNECT_REQUESTED_BIT,
-        pdTRUE,   // Clear on exit (atomic test-and-clear)
-        pdFALSE,  // Don't wait for all bits
-        0         // No blocking
-    );
-    return (bits & EVENT_RECONNECT_REQUESTED_BIT) != 0;
 }
 
 esp_err_t network_playback_started(void) {
