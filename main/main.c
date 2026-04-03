@@ -1214,12 +1214,17 @@ void before_receive_callback(before_receive_callback_data_t *data) {
 
 
 void network_state_cb(void) {
+  static snapcast_state_t prev_state = STOPPED;
   snapcast_state_t state = sc_get_snapcast_state();
   if (state == PLAYING || state == PAUSED) {
     network_playback_started();
-  } else {
+  } else if (prev_state == PLAYING || prev_state == PAUSED) {
+    // Only signal stopped when transitioning from an active playback state.
+    // Prevents transient IDLE during reconnect cycles from triggering
+    // premature ETH takeover.
     network_playback_stopped();
   }
+  prev_state = state;
 }
 
 /**
@@ -1293,7 +1298,7 @@ static void http_get_task(void *pvParameters) {
     // If a reconnect was requested but the inner loop exited via TCP error
     // instead, the server still needs time to tear down the old session.
     if (network_check_and_clear_reconnect()) {
-      ESP_LOGD(TAG, "Pending reconnect; waiting 2s for server cleanup");
+      ESP_LOGI(TAG, "Pending reconnect; waiting 2s for server cleanup");
       vTaskDelay(pdMS_TO_TICKS(2000));
     }
 
@@ -1311,6 +1316,7 @@ static void http_get_task(void *pvParameters) {
     xSemaphoreGive(snapcastStateMux);
     sc_call_state_cb();
     playback = false;
+    bool playback_old = false;
 
     // NETWORK setup ends here ( or before getting mac address )
     setup_network(&connection.netif);
@@ -1465,7 +1471,6 @@ static void http_get_task(void *pvParameters) {
       }
 
       bool restart = false;
-      static bool playback_old = false;
       if (xTaskNotifyWait(0, 0, &command, 1) == pdTRUE) {
         switch(command) {
           case STOP:

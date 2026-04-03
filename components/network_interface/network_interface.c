@@ -32,7 +32,6 @@
 #endif
 
 #include "wifi_interface.h"
-#include "../lightsnapcast/include/player.h"
 
 static const char *TAG = "NET_IF";
 
@@ -123,18 +122,11 @@ esp_err_t network_playback_stopped(void) {
 }
 
 bool network_is_playback_active(void) {
-    // Primary check: Event bits (fast path, set by Layer 1 synchronously)
-    if (network_event_group) {
-        EventBits_t bits = xEventGroupGetBits(network_event_group);
-        if (bits & EVENT_PLAYBACK_STARTED_BIT) {
-            return true;
-        }
+    if (!network_event_group) {
+        return false;
     }
-
-    // Fallback: Direct player state check (catches edge cases)
-    // This protects against race conditions if event bit isn't set yet
-    player_state_e state = get_player_state();
-    return (state == PLAYING);
+    EventBits_t bits = xEventGroupGetBits(network_event_group);
+    return (bits & EVENT_PLAYBACK_STARTED_BIT) != 0;
 }
 
 /* types of ipv6 addresses to be displayed on ipv6 events */
