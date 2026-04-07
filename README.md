@@ -231,7 +231,7 @@ Replace `snapclient.local` with your clients IP address. If you have multiple cl
 
 You are very welcome to help and provide [Pull
 Requests](https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests/about-pull-requests)
-to the project.
+to the project. Use [develop](https://github.com/jorgenkraghjakobsen/snapclient/tree/develop) branch for your PRs as this is the place where new features will go.
 
 We strongly suggest you activate [pre-commit](https://pre-commit.com) hooks in
 this git repository before starting to hack and make commits.

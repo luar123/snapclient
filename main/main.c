@@ -1216,12 +1216,9 @@ void before_receive_callback(before_receive_callback_data_t *data) {
 void network_state_cb(void) {
   static snapcast_state_t prev_state = STOPPED;
   snapcast_state_t state = sc_get_snapcast_state();
-  if (state == PLAYING || state == PAUSED) {
+  if (state == PLAYING) {
     network_playback_started();
-  } else if (prev_state == PLAYING || prev_state == PAUSED) {
-    // Only signal stopped when transitioning from an active playback state.
-    // Prevents transient IDLE during reconnect cycles from triggering
-    // premature ETH takeover.
+  } else if (prev_state == PLAYING) {
     network_playback_stopped();
   }
   prev_state = state;
@@ -1446,17 +1443,7 @@ static void http_get_task(void *pvParameters) {
 
 
     // Main connection loop - state machine + data processing
-    paused = false;
     while (1) {
-      // Process network data first — makes RESTART more responsive by
-      // handling it immediately after the blocking recv returns.
-      int result =
-          process_data(&parser, &time_sync_data, &received_codec_header, &codec,
-                       &scSet, &pcmData, &playback, paused);
-      if (result != 0) {
-        break;  // restart connection
-      }
-
       if (playback_old != playback) {
         if (playback) {
           // need to apply settings when starting to play
@@ -1495,18 +1482,25 @@ static void http_get_task(void *pvParameters) {
           default:
             break;
         }
-      //ESP_LOGI(TAG, "http got cb. %s", paused ? "paused" : "playing/idle");
       }
       if (restart) {
-        //restart required
         netconn_close(lwipNetconn);
         netconn_delete(lwipNetconn);
         lwipNetconn = NULL;
-        // Let server detect disconnect and clean up old session.
-        // Note: eth_interface.c's deferred takeover path waits 2500ms for this
-        // to complete before suppressing WiFi — keep this >= that expectation.
         vTaskDelay(pdMS_TO_TICKS(2000));
-        break; // restart connection
+        break;
+      }
+
+      int result =
+          process_data(&parser, &time_sync_data, &received_codec_header, &codec,
+                       &scSet, &pcmData, &playback, paused);
+      if (result != 0) {
+        // Check if a RESTART arrived during the blocking recv
+        if (xTaskNotifyWait(0, 0, &command, 0) == pdTRUE &&
+            (command == RESTART || command == STOP)) {
+          vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+        break;
       }
     }
   }
@@ -1678,6 +1672,11 @@ void app_main(void) {
   board_i2s_pin_t pin_config0;
   get_i2s_pins(I2S_NUM_0, &pin_config0);
 
+  // Initialize settings and network early so connection starts during codec init
+  settings_manager_init();
+  network_events_init();
+  network_if_init();
+
 #if CONFIG_AUDIO_BOARD_CUSTOM && CONFIG_DAC_ADAU1961
   // some codecs need i2s mclk for initialization
 
@@ -1804,15 +1803,6 @@ void app_main(void) {
   }
   #endif
 
-  // Initialize settings manager (hostname + snapserver settings)
-  settings_manager_init();
-
-  // Initialize network events (must be before network_if_init)
-  network_events_init();
-
-  // Initialize network interfaces (reads settings during startup)
-  network_if_init();
-  
   // Get hostname for mDNS
   char mdns_hostname[64] = {0};
   if (settings_get_hostname(mdns_hostname, sizeof(mdns_hostname)) != ESP_OK) {

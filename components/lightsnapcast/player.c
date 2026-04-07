@@ -593,6 +593,10 @@ int start_player() {
     pcmChkQHdl = xQueueCreate(entries, sizeof(pcm_chunk_message_t *));
     if (pcmChkQHdl == NULL) {
       ESP_LOGE(TAG, "Failed to create pcm chunk queue (%d entries)", entries);
+      tg0_timer_deinit();
+#if CONFIG_PM_ENABLE
+      esp_pm_lock_release(player_pm_lock_handle);
+#endif
       playerStarted = false;
       return -1;
     }
@@ -1546,9 +1550,9 @@ static void player_task(void *pvParameters) {
           pcmChkQHdl = xQueueCreate(entries, sizeof(pcm_chunk_message_t *));
           if (pcmChkQHdl == NULL) {
             ESP_LOGE(TAG, "Failed to create pcm chunk queue (%d entries)", entries);
+          } else {
+            ESP_LOGI(TAG, "created new queue with %d", entries);
           }
-
-          ESP_LOGI(TAG, "created new queue with %d", entries);
         }
 
         if ((scSet.sr != __scSet.sr) || (scSet.bits != __scSet.bits) ||
