@@ -1105,6 +1105,16 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         mac_unification_pending = true;
         mac_unification_netif = netif;
         xSemaphoreGive(connIpSemaphoreHandle);
+
+        // Restart DHCP client — it was stopped on disconnect (see
+        // ETHERNET_EVENT_DISCONNECTED) and won't resume automatically.
+        // Without this, ESP-IDF's internal connected handler takes the
+        // static-IP path ("invalid static ip") and no IPv4 is obtained.
+        esp_err_t dhcp_err = esp_netif_dhcpc_start(netif);
+        if (dhcp_err != ESP_OK && dhcp_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+          ESP_LOGW(TAG, "Failed to restart DHCP on reconnect: %s", esp_err_to_name(dhcp_err));
+        }
+
         ESP_LOGI(TAG, "DHCP mode: MAC unification deferred until takeover...");
       }
 
@@ -1133,6 +1143,20 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
       // Reset MAC unification state on disconnect
       mac_unification_pending = false;
       mac_unification_netif = NULL;
+
+      // Clear stale IPv6 addresses so the next Link Up starts fresh.
+      // Without this, esp_netif_create_ip6_linklocal() operates on a
+      // netif with leftover IPv6 state, increasing stack usage in the
+      // sys_evt task and causing a stack overflow on reconnection.
+      {
+        esp_ip6_addr_t ip6;
+        if (esp_netif_get_ip6_linklocal(netif, &ip6) == ESP_OK) {
+          esp_netif_remove_ip6_address(netif, &ip6);
+        }
+        if (esp_netif_get_ip6_global(netif, &ip6) == ESP_OK) {
+          esp_netif_remove_ip6_address(netif, &ip6);
+        }
+      }
 
       // Revert Ethernet to temp MAC so next Link Up doesn't have the same
       // MAC as WiFi (which causes switch MAC flapping on both ports)
