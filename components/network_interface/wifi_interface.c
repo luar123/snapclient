@@ -9,6 +9,7 @@
 #include <string.h>  // for memcpy
 
 #include "esp_event.h"
+#include "esp_eth.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif_types.h"
@@ -19,6 +20,7 @@
 #include "freertos/portmacro.h"
 #include "freertos/semphr.h"
 #include "network_interface.h"
+#include "network_interface_priv.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
@@ -75,6 +77,7 @@ static esp_netif_t *esp_wifi_netif = NULL;
 static esp_netif_ip_info_t ip_info = {{0}, {0}, {0}};
 static bool connected = false;
 static SemaphoreHandle_t connIpSemaphoreHandle = NULL;
+static volatile bool wifi_suppressed_for_takeover = false;
 
 /* The event group allows multiple bits for each event,
    but we only care about one event - are we connected
@@ -87,11 +90,13 @@ static void event_handler(void *arg, esp_event_base_t event_base, int event_id,
     esp_wifi_connect();
   } else if (event_base == WIFI_EVENT &&
              event_id == WIFI_EVENT_STA_DISCONNECTED) {
-    if ((s_retry_num < WIFI_MAXIMUM_RETRY) || (WIFI_MAXIMUM_RETRY == 0)) {
-      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-      connected = false;
-      xSemaphoreGive(connIpSemaphoreHandle);
+    xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+    connected = false;
+    xSemaphoreGive(connIpSemaphoreHandle);
 
+    if (wifi_suppressed_for_takeover) {
+      ESP_LOGI(TAG, "WiFi disconnected (suppressed for ETH takeover, not reconnecting)");
+    } else if ((s_retry_num < WIFI_MAXIMUM_RETRY) || (WIFI_MAXIMUM_RETRY == 0)) {
       esp_wifi_connect();
       s_retry_num++;
       ESP_LOGV(TAG, "retry to connect to the AP");
@@ -131,6 +136,14 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
   connected = true;
 
   xSemaphoreGive(connIpSemaphoreHandle);
+
+  // Log WiFi MAC for verification
+  uint8_t wifi_mac[ETH_ADDR_LEN];
+  if (network_get_unified_mac_internal(wifi_mac) == ESP_OK) {
+    ESP_LOGI(TAG, "WiFi MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+             wifi_mac[0], wifi_mac[1], wifi_mac[2],
+             wifi_mac[3], wifi_mac[4], wifi_mac[5]);
+  }
 
   ESP_LOGI(TAG, "Wifi Got IP Address");
   ESP_LOGI(TAG, "~~~~~~~~~~~");
@@ -175,6 +188,24 @@ bool wifi_get_ip(esp_netif_ip_info_t *ip) {
   xSemaphoreGive(connIpSemaphoreHandle);
 
   return _connected;
+}
+
+void wifi_suppress_for_takeover(void) {
+    wifi_suppressed_for_takeover = true;
+    ESP_LOGI(TAG, "WiFi suppressed for Ethernet takeover");
+}
+
+void wifi_clear_suppression(bool reconnect) {
+    wifi_suppressed_for_takeover = false;
+    ESP_LOGI(TAG, "WiFi suppression cleared (reconnect=%d)", reconnect);
+    if (reconnect) {
+        s_retry_num = 0;
+        esp_wifi_connect();
+    }
+}
+
+bool wifi_is_suppressed(void) {
+    return wifi_suppressed_for_takeover;
 }
 
 /**
