@@ -1060,10 +1060,9 @@ void handle_chunk_message(codec_type_t codec, playerSetting_t *scSet,
   }
 }
 
-void update_state(bool *received_wire_chnk, bool *playback, bool paused) {
-  static int64_t last = 0;
-  static snapcast_state_t state = IDLE; //Todo
-  if ((paused || state != PLAYING) && (!paused || state != PAUSED) && *received_wire_chnk) {
+void update_state(bool *received_wire_chnk, bool *playback, bool paused,
+                  snapcast_state_t *state, int64_t *last) {
+  if ((paused || *state != PLAYING) && (!paused || *state != PAUSED) && *received_wire_chnk) {
     xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
     if (paused) {
       sc_state = PAUSED;
@@ -1074,29 +1073,29 @@ void update_state(bool *received_wire_chnk, bool *playback, bool paused) {
       ESP_LOGI(TAG, "Set playing");
       *playback = true;
     }
-    state = sc_state;
+    *state = sc_state;
     xSemaphoreGive(snapcastStateMux);
     sc_call_state_cb();
-    last = esp_timer_get_time();
+    *last = esp_timer_get_time();
     *received_wire_chnk = false;
   }
-  else if (state == PLAYING || state == PAUSED) {
+  else if (*state == PLAYING || *state == PAUSED) {
     int64_t now = esp_timer_get_time();
-    if (now-last > 1000000) { //update once per sec
+    if (now - *last > 1000000) { //update once per sec
       if (!(*received_wire_chnk)) {
         xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
         sc_state = IDLE;
         *playback = false;
-        state = sc_state;
+        *state = sc_state;
         xSemaphoreGive(snapcastStateMux);
         sc_call_state_cb();
       ESP_LOGI(TAG, "Set idle");
       }
-      last = now;
+      *last = now;
       *received_wire_chnk = false;
     }
   }
-  
+
 }
 
 
@@ -1108,11 +1107,12 @@ void update_state(bool *received_wire_chnk, bool *playback, bool paused) {
 int process_data(snapcast_protocol_parser_t *parser,
                  time_sync_data_t *time_sync_data, bool *received_codec_header,
                  codec_type_t *codec, snapcastSetting_t *scSet,
-                 pcm_chunk_message_t **pcmData, bool *playback, bool paused) {
+                 pcm_chunk_message_t **pcmData, bool *playback, bool paused,
+                 bool *received_wire_chnk, snapcast_state_t *update_state_tracker,
+                 int64_t *update_last) {
   base_message_t base_message_rx;
 
-  static bool received_wire_chnk = false;
-  update_state(&received_wire_chnk, playback, paused);
+  update_state(received_wire_chnk, playback, paused, update_state_tracker, update_last);
 
   if (parse_base_message(parser, &base_message_rx) != PARSER_OK) {
     return -1;  // restart connection
@@ -1125,7 +1125,7 @@ int process_data(snapcast_protocol_parser_t *parser,
   switch (base_message_rx.type) {
     case SNAPCAST_MESSAGE_WIRE_CHUNK: {
       wire_chunk_message_t wire_chnk = {{0, 0}, 0, NULL};  // is wire_chnk.payload ever used?
-      received_wire_chnk = true;
+      *received_wire_chnk = true;
       // skip this wires chunk message if codec header message was not received yet!
       if (*received_codec_header == false || paused) {
         if (parser_skip_typed_message(parser, &base_message_rx) != PARSER_OK) {
@@ -1442,6 +1442,11 @@ static void http_get_task(void *pvParameters) {
     netconn_set_recvtimeout(lwipNetconn, time_sync_data.timeout / 1000); // timeout in ms
 
 
+    // Connection-scoped state for update_state/process_data
+    bool received_wire_chnk = false;
+    snapcast_state_t update_state_tracker = IDLE;
+    int64_t update_last = 0;
+
     // Main connection loop - state machine + data processing
     while (1) {
       if (playback_old != playback) {
@@ -1493,7 +1498,8 @@ static void http_get_task(void *pvParameters) {
 
       int result =
           process_data(&parser, &time_sync_data, &received_codec_header, &codec,
-                       &scSet, &pcmData, &playback, paused);
+                       &scSet, &pcmData, &playback, paused,
+                       &received_wire_chnk, &update_state_tracker, &update_last);
       if (result != 0) {
         // Check if a RESTART arrived during the blocking recv
         if (xTaskNotifyWait(0, 0, &command, 0) == pdTRUE &&
