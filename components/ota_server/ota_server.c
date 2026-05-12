@@ -22,6 +22,7 @@
 #include "player.h"
 
 extern TaskHandle_t t_http_get_task;
+extern void sc_stop_snapclient();
 
 const int OTA_CONNECTED_BIT = BIT0;
 static const char *TAG = "OTA";
@@ -162,6 +163,8 @@ void ota_server_start_my(void) {
   // SuspendAllThreads();
   // KillAllThreads();
   // dsp_i2s_task_deinit();
+  sc_stop_snapclient();
+  vTaskDelay(1000 / portTICK_PERIOD_MS);  // give snapclient some time to stop before we kill the http task that might be using the player
   vTaskDelete(t_http_get_task);
   deinit_player();  // ensure this is called after http_task was killed
 
