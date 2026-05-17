@@ -201,6 +201,7 @@ void ota_server_start_my(void) {
 
   wait_for_sc_stopped();
   deinit_player();  // ensure this is called after http_task was killed
+  vTaskDelay(pdMS_TO_TICKS(200));  // short delay to ensure all resources are freed before starting OTA
 
   const esp_partition_t *update_partition =
       esp_ota_get_next_update_partition(NULL);

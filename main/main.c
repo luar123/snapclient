@@ -1830,7 +1830,7 @@ void app_main(void) {
   dsp_settings_init();   // Then settings can restore params into the processor
 #endif
 
-  xTaskCreatePinnedToCore(&ota_server_task, "ota", 14 * 256, NULL,
+  xTaskCreatePinnedToCore(&ota_server_task, "ota", 15 * 256, NULL,
                           OTA_TASK_PRIORITY, &t_ota_task, OTA_TASK_CORE_ID);
   sc_start_snapclient();
 
