@@ -514,7 +514,7 @@ void error_callback(const FLAC__StreamDecoder *decoder,
  * Snapclient state functions and types
  */
 
-typedef enum { STOPPED = 0, IDLE, PLAYING, PAUSED } snapclient_state_t; //defined in player.h
+typedef enum { STOPPED = 0, IDLE, PLAYING, PAUSED } snapclient_state_t;
 typedef enum { STOP = 0, START, RESTART, PAUSE, UNPAUSE } snapclient_commands_t;
 
 typedef struct state_cb_s {
@@ -576,9 +576,6 @@ void sc_stop_snapclient() {
  */
 void sc_pause_snapclient(bool pause) {
   pause_player(pause);
-    if (!pause) {
-      //sc_send_command(UNPAUSE);
-    }
 }
 
 /**
@@ -1305,6 +1302,7 @@ static void http_get_task(void *pvParameters) {
     xSemaphoreTake(snapclientStateMux, portMAX_DELAY);
     if (sc_state == STOPPED) {
       xSemaphoreGive(snapclientStateMux);
+      sc_call_state_cb();  // call callbacks here so we can be sure that netconn is closed. Player task could still be running.
       command = STOP;
       while(command != START) {
         xTaskNotifyWait( 0, 0, &command, portMAX_DELAY);
@@ -1451,10 +1449,11 @@ static void http_get_task(void *pvParameters) {
       if (xTaskNotifyWait(0, 0, &command, 1) == pdTRUE) {
         switch(command) {
           case STOP:
+            stop_player_task();  // stop player task for faster teardown
             xSemaphoreTake(snapclientStateMux, portMAX_DELAY);
             sc_state = STOPPED;
             xSemaphoreGive(snapclientStateMux);
-            sc_call_state_cb();
+            // fall through to restart connection and wait for START command
           case RESTART:
             restart = true;
             break;
@@ -1784,6 +1783,7 @@ void app_main(void) {
   init_snapclient(audio_set_volume, audio_set_mute, i2s_pin_config0, I2S_NUM_0, i2s_lock);
   //init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute);
   sc_add_state_cb(on_sc_state_changed);
+  sc_add_state_cb(ota_on_sc_state_changed);
 
   // Create binary semaphore for player state change notification
   snapclientStateChangedMutex = xSemaphoreCreateBinary();

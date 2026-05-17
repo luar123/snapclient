@@ -608,14 +608,20 @@ void pause_player(bool pause) {
   if (pause != playerPaused) {
     playerPaused = pause;
     xSemaphoreGive(playerStateMux);
-    if (pause && playerTaskHandle != NULL) {
-      xTaskNotifyGiveIndexed(playerTaskHandle, 1);
+    if (pause) {
+      stop_player_task();
     }
     else {
       call_state_cb();  // notify state change, e.g. for http task to send pcm
     }
   } else {
     xSemaphoreGive(playerStateMux);
+  }
+}
+
+void stop_player_task() {
+  if (playerTaskHandle != NULL) {
+    xTaskNotifyGiveIndexed(playerTaskHandle, 1);
   }
 }
 
