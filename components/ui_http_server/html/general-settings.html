@@ -641,10 +641,10 @@
           const gatewaySuccess = await setParameter('eth_gateway', gateway);
           if (!gatewaySuccess) throw new Error('Failed to save gateway');
 
-          if (dns) {
-            const dnsSuccess = await setParameter('eth_dns', dns);
-            if (!dnsSuccess) throw new Error('Failed to save DNS');
-          }
+          // Always send DNS so clearing the field erases the persisted value
+          // (backend treats empty string as erase).
+          const dnsSuccess = await setParameter('eth_dns', dns || '');
+          if (!dnsSuccess) throw new Error('Failed to save DNS');
         }
 
         // Update current values

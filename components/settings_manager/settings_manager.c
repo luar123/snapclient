@@ -663,6 +663,7 @@ esp_err_t settings_set_eth_static_ip(const char *ip) {
 
     if (ip == NULL || ip[0] == '\0') {
         err = nvs_erase_key(h, NVS_KEY_ETH_IP);
+        if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK; // absent == cleared
         if (err == ESP_OK) err = nvs_commit(h);
     } else {
         err = nvs_set_str(h, NVS_KEY_ETH_IP, ip);
@@ -733,6 +734,7 @@ esp_err_t settings_set_eth_netmask(const char *netmask) {
 
     if (netmask == NULL || netmask[0] == '\0') {
         err = nvs_erase_key(h, NVS_KEY_ETH_NETMASK);
+        if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK; // absent == cleared
         if (err == ESP_OK) err = nvs_commit(h);
     } else {
         err = nvs_set_str(h, NVS_KEY_ETH_NETMASK, netmask);
@@ -799,6 +801,7 @@ esp_err_t settings_set_eth_gateway(const char *gw) {
 
     if (gw == NULL || gw[0] == '\0') {
         err = nvs_erase_key(h, NVS_KEY_ETH_GATEWAY);
+        if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK; // absent == cleared
         if (err == ESP_OK) err = nvs_commit(h);
     } else {
         err = nvs_set_str(h, NVS_KEY_ETH_GATEWAY, gw);
@@ -865,6 +868,7 @@ esp_err_t settings_set_eth_dns(const char *dns) {
 
     if (dns == NULL || dns[0] == '\0') {
         err = nvs_erase_key(h, NVS_KEY_ETH_DNS);
+        if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK; // absent == cleared
         if (err == ESP_OK) err = nvs_commit(h);
     } else {
         err = nvs_set_str(h, NVS_KEY_ETH_DNS, dns);

@@ -1349,15 +1349,17 @@ static void http_get_task(void *pvParameters) {
         esp_read_mac(base_mac, ESP_MAC_ETH);  // fallback to eFuse
       }
     }
-    sprintf(eth_mac_address, "%02X:%02X:%02X:%02X:%02X:%02X", base_mac[0],
-            base_mac[1], base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
+    snprintf(eth_mac_address, sizeof(eth_mac_address),
+             "%02X:%02X:%02X:%02X:%02X:%02X", base_mac[0],
+             base_mac[1], base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
     ESP_LOGI(TAG, "eth mac: %s", eth_mac_address);
 #endif
     // Get MAC address for WiFi station
     char mac_address[18];
     esp_read_mac(base_mac, ESP_MAC_WIFI_STA);
-    sprintf(mac_address, "%02X:%02X:%02X:%02X:%02X:%02X", base_mac[0],
-            base_mac[1], base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
+    snprintf(mac_address, sizeof(mac_address),
+             "%02X:%02X:%02X:%02X:%02X:%02X", base_mac[0],
+             base_mac[1], base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
     ESP_LOGI(TAG, "sta mac: %s", mac_address);
 
     time_sync_data.now = esp_timer_get_time();

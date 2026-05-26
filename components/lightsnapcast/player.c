@@ -1558,14 +1558,17 @@ static void player_task(void *pvParameters) {
           // so we can save a little RAM here
           entries -= (i2sDmaBufMaxLen * i2sDmaBufCnt) / __scSet.chkInFrames;
 
-          queueCreatedWithChkInFrames = __scSet.chkInFrames;
-
-          pcmChkQHdl = xQueueCreate(entries, sizeof(pcm_chunk_message_t *));
-          if (pcmChkQHdl == NULL) {
-            ESP_LOGE(TAG, "Failed to create pcm chunk queue (%d entries)", entries);
-          } else {
-            ESP_LOGI(TAG, "created new queue with %d", entries);
+          QueueHandle_t newQHdl = xQueueCreate(entries, sizeof(pcm_chunk_message_t *));
+          if (newQHdl == NULL) {
+            // Don't overwrite pcmChkQHdl with NULL — surrounding code (and other
+            // tasks) would then dereference a NULL handle. Abort the player task
+            // here, same pattern as the player_setup_i2s failure above.
+            ESP_LOGE(TAG, "Failed to create pcm chunk queue (%d entries); aborting player task", entries);
+            return;
           }
+          queueCreatedWithChkInFrames = __scSet.chkInFrames;
+          pcmChkQHdl = newQHdl;
+          ESP_LOGI(TAG, "created new queue with %d", entries);
         }
 
         if ((scSet.sr != __scSet.sr) || (scSet.bits != __scSet.bits) ||

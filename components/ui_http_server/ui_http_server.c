@@ -246,9 +246,13 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 		if (strcmp(param, "eth_mode") == 0) {
 			long v = strtol(valstr, NULL, 10);
 			ESP_LOGI(TAG, "%s: Setting eth_mode to: %ld", __func__, v);
-			if (settings_set_eth_mode((int32_t)v) == ESP_OK) {
+			esp_err_t r = settings_set_eth_mode((int32_t)v);
+			if (r == ESP_OK) {
 				httpd_resp_set_status(req, "200 OK");
 				httpd_resp_sendstr(req, "ok");
+			} else if (r == ESP_ERR_INVALID_ARG) {
+				httpd_resp_set_status(req, "400 Bad Request");
+				httpd_resp_sendstr(req, "Invalid eth_mode value");
 			} else {
 				httpd_resp_set_status(req, "500 Internal Server Error");
 				httpd_resp_sendstr(req, "error");
@@ -261,12 +265,16 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 			char decoded_ip[16] = {0};
 			url_decode(decoded_ip, valstr, sizeof(decoded_ip));
 			ESP_LOGI(TAG, "%s: Setting eth_static_ip to: %s", __func__, decoded_ip);
-			if (settings_set_eth_static_ip(decoded_ip) == ESP_OK) {
+			esp_err_t r = settings_set_eth_static_ip(decoded_ip);
+			if (r == ESP_OK) {
 				httpd_resp_set_status(req, "200 OK");
 				httpd_resp_sendstr(req, "ok");
-			} else {
+			} else if (r == ESP_ERR_INVALID_ARG) {
 				httpd_resp_set_status(req, "400 Bad Request");
 				httpd_resp_sendstr(req, "Invalid IP address");
+			} else {
+				httpd_resp_set_status(req, "500 Internal Server Error");
+				httpd_resp_sendstr(req, "error");
 			}
 			return ESP_OK;
 		}
@@ -276,12 +284,16 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 			char decoded_netmask[16] = {0};
 			url_decode(decoded_netmask, valstr, sizeof(decoded_netmask));
 			ESP_LOGI(TAG, "%s: Setting eth_netmask to: %s", __func__, decoded_netmask);
-			if (settings_set_eth_netmask(decoded_netmask) == ESP_OK) {
+			esp_err_t r = settings_set_eth_netmask(decoded_netmask);
+			if (r == ESP_OK) {
 				httpd_resp_set_status(req, "200 OK");
 				httpd_resp_sendstr(req, "ok");
-			} else {
+			} else if (r == ESP_ERR_INVALID_ARG) {
 				httpd_resp_set_status(req, "400 Bad Request");
 				httpd_resp_sendstr(req, "Invalid netmask");
+			} else {
+				httpd_resp_set_status(req, "500 Internal Server Error");
+				httpd_resp_sendstr(req, "error");
 			}
 			return ESP_OK;
 		}
@@ -291,12 +303,16 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 			char decoded_gw[16] = {0};
 			url_decode(decoded_gw, valstr, sizeof(decoded_gw));
 			ESP_LOGI(TAG, "%s: Setting eth_gateway to: %s", __func__, decoded_gw);
-			if (settings_set_eth_gateway(decoded_gw) == ESP_OK) {
+			esp_err_t r = settings_set_eth_gateway(decoded_gw);
+			if (r == ESP_OK) {
 				httpd_resp_set_status(req, "200 OK");
 				httpd_resp_sendstr(req, "ok");
-			} else {
+			} else if (r == ESP_ERR_INVALID_ARG) {
 				httpd_resp_set_status(req, "400 Bad Request");
 				httpd_resp_sendstr(req, "Invalid gateway");
+			} else {
+				httpd_resp_set_status(req, "500 Internal Server Error");
+				httpd_resp_sendstr(req, "error");
 			}
 			return ESP_OK;
 		}
@@ -306,12 +322,16 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 			char decoded_dns[16] = {0};
 			url_decode(decoded_dns, valstr, sizeof(decoded_dns));
 			ESP_LOGI(TAG, "%s: Setting eth_dns to: %s", __func__, decoded_dns);
-			if (settings_set_eth_dns(decoded_dns) == ESP_OK) {
+			esp_err_t r = settings_set_eth_dns(decoded_dns);
+			if (r == ESP_OK) {
 				httpd_resp_set_status(req, "200 OK");
 				httpd_resp_sendstr(req, "ok");
-			} else {
+			} else if (r == ESP_ERR_INVALID_ARG) {
 				httpd_resp_set_status(req, "400 Bad Request");
 				httpd_resp_sendstr(req, "Invalid DNS");
+			} else {
+				httpd_resp_set_status(req, "500 Internal Server Error");
+				httpd_resp_sendstr(req, "error");
 			}
 			return ESP_OK;
 		}

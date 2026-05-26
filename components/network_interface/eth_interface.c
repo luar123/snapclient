@@ -1563,9 +1563,6 @@ void eth_start(void) {
     return;
   }
 
-  // Save handles for deferred MAC unification
-  s_eth_handles = eth_handles;
-
 #if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
   esp_netif_t *eth_netif = NULL;
 
@@ -1669,6 +1666,13 @@ void eth_start(void) {
 
     }
   }
+
+  // All netif creation/glue/attach paths above succeeded — only now is it safe
+  // to publish the driver handle array. Earlier cleanup paths call
+  // eth_cleanup_drivers(eth_handles, ...) which frees the array; assigning
+  // earlier would leave s_eth_handles dangling and crash later callers of
+  // eth_apply_unified_mac().
+  s_eth_handles = eth_handles;
 
   // Register event handlers - non-fatal if these fail
   ret = esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
