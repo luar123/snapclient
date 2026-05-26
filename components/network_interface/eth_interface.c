@@ -31,7 +31,7 @@
 #include "network_interface_priv.h"
 #include "settings_manager.h"
 
-extern void sc_restart_snapcast(void);
+extern void sc_restart_snapclient(void);
 
 static const char *TAG = "ETH_IF";
 
@@ -868,13 +868,13 @@ static void eth_check_and_apply_takeover(esp_netif_t *netif) {
       esp_netif_dhcpc_stop(netif);
       esp_netif_dhcpc_start(netif);
 
-      sc_restart_snapcast();
+      sc_restart_snapclient();
     } else {
       // No MAC unification needed - just complete takeover
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
       we_changed_default_netif = true;
       xSemaphoreGive(connIpSemaphoreHandle);
-      sc_restart_snapcast();
+      sc_restart_snapclient();
     }
   } else if (want_eth_takeover && network_is_playback_active()) {
     ESP_LOGI(TAG, "Playback active; deferring Ethernet takeover until playback stops");
@@ -1198,7 +1198,7 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
           esp_netif_set_default_netif(sta_netif);
         }
         /* Request reconnect so main re-evaluates network and uses WiFi */
-        sc_restart_snapcast();
+        sc_restart_snapclient();
       } else {
         /* Preserve want_eth_takeover on brief disconnect - if Ethernet reconnects
          * quickly, we still want to complete the takeover. Only clear if we
@@ -1399,7 +1399,7 @@ static void eth_on_playback_stopped(void) {
       }
     }
 
-    sc_restart_snapcast();
+    sc_restart_snapclient();
 
     // Wait for main loop to close old connection + server cleanup.
     // The main loop's RESTART path delays 2000ms after socket close
@@ -1499,7 +1499,7 @@ static void eth_on_playback_stopped(void) {
         xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
         we_changed_default_netif = true;
         xSemaphoreGive(connIpSemaphoreHandle);
-        sc_restart_snapcast();
+        sc_restart_snapclient();
       } else {
         ESP_LOGE(TAG, "Failed to set default netif: %s", esp_err_to_name(err));
         // Restore takeover intent so it can be retried

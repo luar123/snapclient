@@ -346,6 +346,12 @@ static esp_err_t player_setup_i2s(playerSetting_t *setting, bool lock) {
 #endif
       .gpio_cfg = pin_config0,
   };
+#if CONFIG_I2S_SLOT_32BIT
+  // MA120X0P (and similar) only support 32-bit or 24-bit BCLK frames.
+  // Override slot width so the ESP32 sends 32 BCLK pulses per channel;
+  // 16-bit samples are zero-padded by the IDF automatically.
+  tx_std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+#endif
 
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &tx_std_cfg));
   // This prevents pops/clicks on some I2S codecs
@@ -503,6 +509,7 @@ int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*s
     xSemaphoreGive(playerStateMux);
   }
 
+
   // create semaphore for time diff buffer to server
   if (latencyBufSemaphoreHandle == NULL) {
     latencyBufSemaphoreHandle = xSemaphoreCreateMutex();
@@ -621,14 +628,20 @@ void pause_player(bool pause) {
   if (pause != playerPaused) {
     playerPaused = pause;
     xSemaphoreGive(playerStateMux);
-    if (pause && playerTaskHandle != NULL) {
-      xTaskNotifyGiveIndexed(playerTaskHandle, 1);
+    if (pause) {
+      stop_player_task();
     }
     else {
       call_state_cb();  // notify state change, e.g. for http task to send pcm
     }
   } else {
     xSemaphoreGive(playerStateMux);
+  }
+}
+
+void stop_player_task() {
+  if (playerTaskHandle != NULL) {
+    xTaskNotifyGiveIndexed(playerTaskHandle, 1);
   }
 }
 

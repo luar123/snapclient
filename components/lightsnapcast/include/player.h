@@ -64,6 +64,7 @@ int init_player(i2s_std_gpio_config_t pin_config0_, i2s_port_t i2sNum_, void (*s
 int deinit_player(void);
 int start_player(void);
 void pause_player(bool pause);
+void stop_player_task(void);
 
 int32_t allocate_pcm_chunk_memory(pcm_chunk_message_t **pcmChunk, size_t bytes);
 int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk);

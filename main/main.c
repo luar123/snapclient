@@ -108,7 +108,7 @@ static const char *TAG = "SC";
 SemaphoreHandle_t timeSyncSemaphoreHandle = NULL;
 
 static SemaphoreHandle_t idCounterSemaphoreHandle = NULL;
-static SemaphoreHandle_t snapcastStateChangedMutex = NULL;
+static SemaphoreHandle_t snapclientStateChangedMutex = NULL;
 
 typedef struct snapcastSetting_s {
   playerSetting_t playerSetting;
@@ -128,7 +128,7 @@ static QueueHandle_t audioDACQHdl = NULL;
 static SemaphoreHandle_t audioDACSemaphore = NULL;
 static void (*set_volume_cb)(int volume);
 static void (*set_mute_cb)(bool mute, bool state);
-static SemaphoreHandle_t snapcastStateMux = NULL;
+static SemaphoreHandle_t snapclientStateMux = NULL;
 static SemaphoreHandle_t i2sLockMutex = NULL;
 
 void time_sync_msg_cb(void *args);
@@ -511,32 +511,48 @@ void error_callback(const FLAC__StreamDecoder *decoder,
            FLAC__StreamDecoderErrorStatusString[status]);
 }
 
-typedef enum { STOPPED = 0, IDLE, PLAYING, PAUSED } snapcast_state_t; //defined in player.h
-typedef enum { STOP = 0, START, RESTART, PAUSE, UNPAUSE } snapcast_commands_t;
+/**
+ * Snapclient state functions and types
+ */
+
+typedef enum { STOPPED = 0, IDLE, PLAYING, PAUSED } snapclient_state_t;
+typedef enum { STOP = 0, START, RESTART, PAUSE, UNPAUSE } snapclient_commands_t;
 
 typedef struct state_cb_s {
   void (*cb)(void);
   struct state_cb_s *next;
 } state_cb_t;
 
-static snapcast_state_t sc_state = STOPPED;
+static snapclient_state_t sc_state = STOPPED;
 static state_cb_t *state_cb_head = NULL;
 
+/**
+ * Set mute state called by player
+ */
 void player_set_mute(bool mute) {
   set_mute_cb(mute, false);
 }
 
+/**
+ * Set mute state called by snapclient
+ */
 void set_mute_state(bool mute) {
   set_mute_cb(mute, true);
 }
 
-void sc_send_command(snapcast_commands_t command) {
+/**
+ * Sends command to http task, e.g. to start snapclient or pause player.
+ */
+void sc_send_command(snapclient_commands_t command) {
   if (t_http_get_task != NULL) {
     xTaskNotify(t_http_get_task, (uint32_t) command, eSetValueWithOverwrite);
   }
 }
 
-void player_state_paused(bool paused) {
+/**
+ * Callback for player state changes, e.g. to send pause command to snapclient when player is paused.
+ */
+void on_player_state_paused(bool paused) {
   if (paused) {
     sc_send_command(PAUSE);
   } else {
@@ -544,29 +560,32 @@ void player_state_paused(bool paused) {
   }
 }
 
-void sc_start_snapcast() {
+void sc_start_snapclient() {
   sc_send_command(START);
 }
 
-void sc_restart_snapcast() {
+void sc_restart_snapclient() {
   sc_send_command(RESTART);
 }
 
-void sc_stop_snapcast() {
+void sc_stop_snapclient() {
   sc_send_command(STOP);
 }
 
-void sc_pause_snapcast(bool pause) {
+/**
+ * Pause snapclient. This will first pause the player. Snapclient is then paused by the player callback.
+ */
+void sc_pause_snapclient(bool pause) {
   pause_player(pause);
-    if (!pause) {
-      //sc_send_command(UNPAUSE);
-    }
 }
 
-snapcast_state_t sc_get_snapcast_state(void) {
-  xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
-  snapcast_state_t state = sc_state;
-  xSemaphoreGive(snapcastStateMux);
+/**
+ * Get snapclient state
+ */
+snapclient_state_t sc_get_snapclient_state(void) {
+  xSemaphoreTake(snapclientStateMux, portMAX_DELAY);
+  snapclient_state_t state = sc_state;
+  xSemaphoreGive(snapclientStateMux);
   return state;
 }
 
@@ -581,7 +600,7 @@ void sc_call_state_cb(void) {
 }
 
 /**
- * add callback to be called when snapcast state changes, e.g. from not started to started.
+ * add callback to be called when snapclient state changes, e.g. from not started to started.
  * Callbacks needs to be implemented thread safe as they will be called from http task
  */
 void sc_add_state_cb(void (*cb)()) {
@@ -1060,10 +1079,22 @@ void handle_chunk_message(codec_type_t codec, playerSetting_t *scSet,
   }
 }
 
-void update_state(bool *received_wire_chnk, bool *playback, bool paused,
-                  snapcast_state_t *state, int64_t *last) {
-  if ((paused || *state != PLAYING) && (!paused || *state != PAUSED) && *received_wire_chnk) {
-    xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+// File-scope statics for update_state / process_data so reset_connection_state()
+// can clear them between snapclient connections (otherwise stale "playing" state
+// from the previous connection can survive for ~1s into the new one).
+static int64_t  update_state_last  = 0;
+static snapclient_state_t update_state_local = IDLE;
+static bool     process_data_received_wire_chnk = false;
+
+void reset_connection_state(void) {
+  update_state_last = 0;
+  update_state_local = IDLE;
+  process_data_received_wire_chnk = false;
+}
+
+void update_state(bool *received_wire_chnk, bool *playback, bool paused) {
+  if ((paused || update_state_local != PLAYING) && (!paused || update_state_local != PAUSED) && *received_wire_chnk) {
+    xSemaphoreTake(snapclientStateMux, portMAX_DELAY);
     if (paused) {
       sc_state = PAUSED;
       *playback = false;
@@ -1073,25 +1104,25 @@ void update_state(bool *received_wire_chnk, bool *playback, bool paused,
       ESP_LOGI(TAG, "Set playing");
       *playback = true;
     }
-    *state = sc_state;
-    xSemaphoreGive(snapcastStateMux);
+    update_state_local = sc_state;
+    xSemaphoreGive(snapclientStateMux);
     sc_call_state_cb();
-    *last = esp_timer_get_time();
+    update_state_last = esp_timer_get_time();
     *received_wire_chnk = false;
   }
-  else if (*state == PLAYING || *state == PAUSED) {
+  else if (update_state_local == PLAYING || update_state_local == PAUSED) {
     int64_t now = esp_timer_get_time();
-    if (now - *last > 1000000) { //update once per sec
+    if (now - update_state_last > 1000000) { //update once per sec
       if (!(*received_wire_chnk)) {
-        xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+        xSemaphoreTake(snapclientStateMux, portMAX_DELAY);
         sc_state = IDLE;
         *playback = false;
-        *state = sc_state;
-        xSemaphoreGive(snapcastStateMux);
+        update_state_local = sc_state;
+        xSemaphoreGive(snapclientStateMux);
         sc_call_state_cb();
       ESP_LOGI(TAG, "Set idle");
       }
-      *last = now;
+      update_state_last = now;
       *received_wire_chnk = false;
     }
   }
@@ -1107,12 +1138,10 @@ void update_state(bool *received_wire_chnk, bool *playback, bool paused,
 int process_data(snapcast_protocol_parser_t *parser,
                  time_sync_data_t *time_sync_data, bool *received_codec_header,
                  codec_type_t *codec, snapcastSetting_t *scSet,
-                 pcm_chunk_message_t **pcmData, bool *playback, bool paused,
-                 bool *received_wire_chnk, snapcast_state_t *update_state_tracker,
-                 int64_t *update_last) {
+                 pcm_chunk_message_t **pcmData, bool *playback, bool paused) {
   base_message_t base_message_rx;
 
-  update_state(received_wire_chnk, playback, paused, update_state_tracker, update_last);
+  update_state(&process_data_received_wire_chnk, playback, paused);
 
   if (parse_base_message(parser, &base_message_rx) != PARSER_OK) {
     return -1;  // restart connection
@@ -1125,7 +1154,7 @@ int process_data(snapcast_protocol_parser_t *parser,
   switch (base_message_rx.type) {
     case SNAPCAST_MESSAGE_WIRE_CHUNK: {
       wire_chunk_message_t wire_chnk = {{0, 0}, 0, NULL};  // is wire_chnk.payload ever used?
-      *received_wire_chnk = true;
+      process_data_received_wire_chnk = true;
       // skip this wires chunk message if codec header message was not received yet!
       if (*received_codec_header == false || paused) {
         if (parser_skip_typed_message(parser, &base_message_rx) != PARSER_OK) {
@@ -1214,8 +1243,8 @@ void before_receive_callback(before_receive_callback_data_t *data) {
 
 
 void network_state_cb(void) {
-  static snapcast_state_t prev_state = STOPPED;
-  snapcast_state_t state = sc_get_snapcast_state();
+  static snapclient_state_t prev_state = STOPPED;
+  snapclient_state_t state = sc_get_snapclient_state();
   if (state == PLAYING) {
     network_playback_started();
   } else if (prev_state == PLAYING) {
@@ -1293,20 +1322,20 @@ static void http_get_task(void *pvParameters) {
     }
 
     // block if state = STOPPED
-    xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+    xSemaphoreTake(snapclientStateMux, portMAX_DELAY);
     if (sc_state == STOPPED) {
-      xSemaphoreGive(snapcastStateMux);
+      xSemaphoreGive(snapclientStateMux);
+      sc_call_state_cb();  // call callbacks here so we can be sure that netconn is closed. Player task could still be running.
       command = STOP;
       while(command != START) {
         xTaskNotifyWait( 0, 0, &command, portMAX_DELAY);
       }
-      xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
+      xSemaphoreTake(snapclientStateMux, portMAX_DELAY);
     }
     sc_state = IDLE;
-    xSemaphoreGive(snapcastStateMux);
+    xSemaphoreGive(snapclientStateMux);
     sc_call_state_cb();
     playback = false;
-    bool playback_old = false;
 
     // NETWORK setup ends here ( or before getting mac address )
     setup_network(&connection.netif);
@@ -1441,14 +1470,43 @@ static void http_get_task(void *pvParameters) {
     time_sync_data.timeout = FAST_SYNC_LATENCY_BUF;
     netconn_set_recvtimeout(lwipNetconn, time_sync_data.timeout / 1000); // timeout in ms
 
-
-    // Connection-scoped state for update_state/process_data
-    bool received_wire_chnk = false;
-    snapcast_state_t update_state_tracker = IDLE;
-    int64_t update_last = 0;
+    reset_connection_state();
 
     // Main connection loop - state machine + data processing
     while (1) {
+      bool restart = false;
+      static bool playback_old = false;
+      if (xTaskNotifyWait(0, 0, &command, 1) == pdTRUE) {
+        switch(command) {
+          case STOP:
+            stop_player_task();  // stop player task for faster teardown
+            xSemaphoreTake(snapclientStateMux, portMAX_DELAY);
+            sc_state = STOPPED;
+            xSemaphoreGive(snapclientStateMux);
+            // fall through to restart connection and wait for START command
+          case RESTART:
+            restart = true;
+            break;
+          case UNPAUSE:
+            paused = false;
+            break;
+          case PAUSE:
+            paused = true;
+            break;
+          default:
+            break;
+        }
+      //ESP_LOGI(TAG, "http got cb. %s", paused ? "paused" : "playing/idle");
+      }
+      if (restart) {
+        //restart required
+        netconn_close(lwipNetconn);
+        netconn_delete(lwipNetconn);
+        lwipNetconn = NULL;
+        vTaskDelay(pdMS_TO_TICKS(2000)); // back-off before reconnecting
+        break; // restart connection
+      }
+
       if (playback_old != playback) {
         if (playback) {
           // need to apply settings when starting to play
@@ -1466,40 +1524,9 @@ static void http_get_task(void *pvParameters) {
         playback_old = playback;
       }
 
-      bool restart = false;
-      if (xTaskNotifyWait(0, 0, &command, 1) == pdTRUE) {
-        switch(command) {
-          case STOP:
-            xSemaphoreTake(snapcastStateMux, portMAX_DELAY);
-            sc_state = STOPPED;
-            xSemaphoreGive(snapcastStateMux);
-            sc_call_state_cb();
-            /* fall through — STOP also needs to close the connection */
-          case RESTART:
-            restart = true;
-            break;
-          case UNPAUSE:
-            paused = false;
-            break;
-          case PAUSE:
-            paused = true;
-            break;
-          default:
-            break;
-        }
-      }
-      if (restart) {
-        netconn_close(lwipNetconn);
-        netconn_delete(lwipNetconn);
-        lwipNetconn = NULL;
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        break;
-      }
-
       int result =
           process_data(&parser, &time_sync_data, &received_codec_header, &codec,
-                       &scSet, &pcmData, &playback, paused,
-                       &received_wire_chnk, &update_state_tracker, &update_last);
+                       &scSet, &pcmData, &playback, paused);
       if (result != 0) {
         // Check if a RESTART arrived during the blocking recv
         if (xTaskNotifyWait(0, 0, &command, 0) == pdTRUE &&
@@ -1515,7 +1542,7 @@ static void http_get_task(void *pvParameters) {
 /**
  *
  */
-int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool, bool), i2s_std_gpio_config_t i2s_pin_config0, i2s_port_t I2S_NUM_0, bool (*lock)(bool, TickType_t)) {
+int init_snapclient(void (*set_volume)(int), void (*set_mute)(bool, bool), i2s_std_gpio_config_t i2s_pin_config0, i2s_port_t I2S_NUM_0, bool (*lock)(bool, TickType_t)) {
   if (set_volume == NULL) {
     ESP_LOGE(TAG, "Volume callback is NULL");
 
@@ -1528,10 +1555,10 @@ int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool, bool), i2s_std
   }
   set_volume_cb = set_volume;
   set_mute_cb = set_mute;
-  if (snapcastStateMux == NULL) {
-    snapcastStateMux = xSemaphoreCreateMutex();
+  if (snapclientStateMux == NULL) {
+    snapclientStateMux = xSemaphoreCreateMutex();
   }
-  init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute, player_state_paused, lock);
+  init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute, on_player_state_paused, lock);
 
   xTaskCreatePinnedToCore(&http_get_task, "http", 15 * 1024, NULL,
                         HTTP_TASK_PRIORITY, &t_http_get_task,
@@ -1597,10 +1624,12 @@ void audio_set_volume(int volume) {
   }
   xSemaphoreGive(audioDACSemaphore);
 }
-
-void sc_state_changed() {
-  if (snapcastStateChangedMutex != NULL) {
-    xSemaphoreGive(snapcastStateChangedMutex);
+/**
+ * Callback for snapclient state changes (playing, paused, idle). Used to trigger actions on state changes, e.g. muting the audio output when paused or idle.
+ */
+void on_sc_state_changed() {
+  if (snapclientStateChangedMutex != NULL) {
+    xSemaphoreGive(snapclientStateChangedMutex);
   }
   ESP_LOGI(TAG, "main task cb");
 }
@@ -1790,15 +1819,16 @@ void app_main(void) {
 
   i2sLockMutex = xSemaphoreCreateBinary();
 
-  init_snapcast(audio_set_volume, audio_set_mute, i2s_pin_config0, I2S_NUM_0, i2s_lock);
+  init_snapclient(audio_set_volume, audio_set_mute, i2s_pin_config0, I2S_NUM_0, i2s_lock);
   //init_player(i2s_pin_config0, I2S_NUM_0, player_set_mute);
-  sc_add_state_cb(sc_state_changed);
+  sc_add_state_cb(on_sc_state_changed);
+  sc_add_state_cb(ota_on_sc_state_changed);
   sc_add_state_cb(network_state_cb);
 
   // Create binary semaphore for player state change notification
-  snapcastStateChangedMutex = xSemaphoreCreateBinary();
-  if (snapcastStateChangedMutex == NULL) {
-    ESP_LOGE(TAG, "Failed to create snapcastStateChangedMutex");
+  snapclientStateChangedMutex = xSemaphoreCreateBinary();
+  if (snapclientStateChangedMutex == NULL) {
+    ESP_LOGE(TAG, "Failed to create snapclientStateChangedMutex");
     return;
   }
 
@@ -1837,9 +1867,9 @@ void app_main(void) {
   dsp_settings_init();   // Then settings can restore params into the processor
 #endif
 
-  xTaskCreatePinnedToCore(&ota_server_task, "ota", 14 * 256, NULL,
+  xTaskCreatePinnedToCore(&ota_server_task, "ota", 15 * 256, NULL,
                           OTA_TASK_PRIORITY, &t_ota_task, OTA_TASK_CORE_ID);
-  sc_start_snapcast();
+  sc_start_snapclient();
 
   //  while (1) {
   //    // audio_event_iface_msg_t msg;
@@ -1867,13 +1897,13 @@ void app_main(void) {
   esp_pm_configure(&pmConfig);
 #endif
   audioDACdata_t dac_data;
-  snapcast_state_t state = IDLE;
+  snapclient_state_t state = IDLE;
   while (1) {
     if (xQueueReceive(audioDACQHdl, &dac_data, pdMS_TO_TICKS(90)) == pdTRUE) {
       dac_control(board_handle, dac_data);
     }
-    if (xSemaphoreTake(snapcastStateChangedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      snapcast_state_t state_new = sc_get_snapcast_state();
+    if (xSemaphoreTake(snapclientStateChangedMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      snapclient_state_t state_new = sc_get_snapclient_state();
       ESP_LOGI(TAG, "main got cb: %d", state_new);
       if (state_new != state) {
         ESP_LOGI(TAG, "Player state changed: %d -> %d", state, state_new);
