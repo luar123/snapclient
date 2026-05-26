@@ -1079,21 +1079,10 @@ void handle_chunk_message(codec_type_t codec, playerSetting_t *scSet,
   }
 }
 
-// File-scope statics for update_state / process_data so reset_connection_state()
-// can clear them between snapclient connections (otherwise stale "playing" state
-// from the previous connection can survive for ~1s into the new one).
-static int64_t  update_state_last  = 0;
-static snapclient_state_t update_state_local = IDLE;
-static bool     process_data_received_wire_chnk = false;
-
-void reset_connection_state(void) {
-  update_state_last = 0;
-  update_state_local = IDLE;
-  process_data_received_wire_chnk = false;
-}
-
 void update_state(bool *received_wire_chnk, bool *playback, bool paused) {
-  if ((paused || update_state_local != PLAYING) && (!paused || update_state_local != PAUSED) && *received_wire_chnk) {
+  static int64_t last = 0;
+  static snapclient_state_t state = IDLE; //Todo
+  if ((paused || state != PLAYING) && (!paused || state != PAUSED) && *received_wire_chnk) {
     xSemaphoreTake(snapclientStateMux, portMAX_DELAY);
     if (paused) {
       sc_state = PAUSED;
@@ -1104,25 +1093,25 @@ void update_state(bool *received_wire_chnk, bool *playback, bool paused) {
       ESP_LOGI(TAG, "Set playing");
       *playback = true;
     }
-    update_state_local = sc_state;
+    state = sc_state;
     xSemaphoreGive(snapclientStateMux);
     sc_call_state_cb();
-    update_state_last = esp_timer_get_time();
+    last = esp_timer_get_time();
     *received_wire_chnk = false;
   }
-  else if (update_state_local == PLAYING || update_state_local == PAUSED) {
+  else if (state == PLAYING || state == PAUSED) {
     int64_t now = esp_timer_get_time();
-    if (now - update_state_last > 1000000) { //update once per sec
+    if (now-last > 1000000) { //update once per sec
       if (!(*received_wire_chnk)) {
         xSemaphoreTake(snapclientStateMux, portMAX_DELAY);
         sc_state = IDLE;
         *playback = false;
-        update_state_local = sc_state;
+        state = sc_state;
         xSemaphoreGive(snapclientStateMux);
         sc_call_state_cb();
       ESP_LOGI(TAG, "Set idle");
       }
-      update_state_last = now;
+      last = now;
       *received_wire_chnk = false;
     }
   }
@@ -1141,7 +1130,8 @@ int process_data(snapcast_protocol_parser_t *parser,
                  pcm_chunk_message_t **pcmData, bool *playback, bool paused) {
   base_message_t base_message_rx;
 
-  update_state(&process_data_received_wire_chnk, playback, paused);
+  static bool received_wire_chnk = false;
+  update_state(&received_wire_chnk, playback, paused);
 
   if (parse_base_message(parser, &base_message_rx) != PARSER_OK) {
     return -1;  // restart connection
@@ -1154,7 +1144,7 @@ int process_data(snapcast_protocol_parser_t *parser,
   switch (base_message_rx.type) {
     case SNAPCAST_MESSAGE_WIRE_CHUNK: {
       wire_chunk_message_t wire_chnk = {{0, 0}, 0, NULL};  // is wire_chnk.payload ever used?
-      process_data_received_wire_chnk = true;
+      received_wire_chnk = true;
       // skip this wires chunk message if codec header message was not received yet!
       if (*received_codec_header == false || paused) {
         if (parser_skip_typed_message(parser, &base_message_rx) != PARSER_OK) {
@@ -1470,7 +1460,6 @@ static void http_get_task(void *pvParameters) {
     time_sync_data.timeout = FAST_SYNC_LATENCY_BUF;
     netconn_set_recvtimeout(lwipNetconn, time_sync_data.timeout / 1000); // timeout in ms
 
-    reset_connection_state();
 
     // Main connection loop - state machine + data processing
     while (1) {
