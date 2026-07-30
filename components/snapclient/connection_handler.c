@@ -175,9 +175,15 @@ void setup_network(esp_netif_t** netif) {
       }
 
       if (ipaddr_aton(static_host, &remote_ip) == 0) {
-        ESP_LOGE(TAG, "can't convert static server address to numeric: %s",
-                 static_host);
-        continue;
+        // Not a numeric IP literal - resolve the configured host via DNS so a
+        // hostname (not only a numeric address) works for the static server.
+        err_t host_err = netconn_gethostbyname(static_host, &remote_ip);
+        if (host_err != ERR_OK) {
+          ESP_LOGE(TAG, "can't resolve static server host '%s', err %d",
+                   static_host, host_err);
+          vTaskDelay(pdMS_TO_TICKS(1000));
+          continue;
+        }
       }
 
       remotePort = (uint16_t)static_port;
