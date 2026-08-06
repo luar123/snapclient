@@ -41,4 +41,8 @@ void wifi_clear_suppression(bool reconnect);
 /** Check if WiFi is currently suppressed for takeover */
 bool wifi_is_suppressed(void);
 
+/** Set WiFi power save mode: enable=false while audio is playing,
+ *  enable=true when idle. No-op unless CONFIG_WIFI_DYNAMIC_POWER_SAVE is set. */
+void wifi_set_power_save(bool enable);
+
 #endif /* COMPONENTS_NETWORK_INTERFACE_PRIV_INCLUDE_NETWORK_INTERFACE_PRIV_H_ */

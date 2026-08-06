@@ -72,6 +72,40 @@ static char mac_address[18];
 
 static int s_retry_num = 0;
 
+/* Power save mode to use while audio is not playing */
+static wifi_ps_type_t wifi_idle_ps_mode(void) {
+#if defined(CONFIG_WIFI_PS_NONE_MODE)
+  return WIFI_PS_NONE;
+#elif defined(CONFIG_WIFI_PS_MAX_MODEM_MODE)
+  return WIFI_PS_MAX_MODEM;
+#else
+  return WIFI_PS_MIN_MODEM;
+#endif
+}
+
+/* Apply a power save mode, skipping the call if it is already active.
+ * network_state_cb() re-signals playback on every state callback, so without
+ * this guard esp_wifi_set_ps() and its log line would repeat continuously. */
+static void wifi_apply_ps_mode(wifi_ps_type_t mode) {
+  static wifi_ps_type_t current_mode = WIFI_PS_MIN_MODEM;  // ESP-IDF default
+
+  if (mode == current_mode) {
+    return;
+  }
+
+  esp_err_t err = esp_wifi_set_ps(mode);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "failed to set wifi power save: %s", esp_err_to_name(err));
+    return;
+  }
+
+  current_mode = mode;
+  ESP_LOGI(TAG, "wifi power save: %s",
+           (mode == WIFI_PS_NONE)        ? "NONE"
+           : (mode == WIFI_PS_MAX_MODEM) ? "MAX_MODEM"
+                                         : "MIN_MODEM");
+}
+
 static esp_netif_t *esp_wifi_netif = NULL;
 
 static esp_netif_ip_info_t ip_info = {{0}, {0}, {0}};
@@ -227,9 +261,6 @@ void wifi_start(void) {
   esp_wifi_netif = esp_netif_create_wifi(WIFI_IF_STA, &esp_netif_config);
   esp_wifi_set_default_wifi_sta_handlers();
 
-  // esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-  //   esp_wifi_set_ps(WIFI_PS_NONE);
-
 #if ENABLE_WIFI_PROVISIONING
   /* Start Wi-Fi station */
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -252,6 +283,7 @@ void wifi_start(void) {
                                              &lost_ip_event_handler, NULL));
 
   ESP_ERROR_CHECK(esp_wifi_start());
+  wifi_apply_ps_mode(wifi_idle_ps_mode());
 
   ESP_LOGI(TAG, "Starting provisioning");
 
@@ -294,8 +326,28 @@ void wifi_start(void) {
                                              &lost_ip_event_handler, NULL));
 
   ESP_ERROR_CHECK(esp_wifi_start());
+  wifi_apply_ps_mode(wifi_idle_ps_mode());
 
   ESP_LOGI(TAG, "wifi_init_sta finished. Trying to connect to %s",
            wifi_config.sta.ssid);
+#endif
+}
+
+/**
+ * Set WiFi power save mode based on playback state.
+ * enable=false pins the radio awake during playback for best throughput,
+ * enable=true returns it to the configured idle mode.
+ */
+void wifi_set_power_save(bool enable) {
+#if defined(CONFIG_WIFI_DYNAMIC_POWER_SAVE)
+  // While Ethernet has taken over, WiFi carries no audio - stay in the idle
+  // mode rather than holding the radio awake for an unused link.
+  if (enable || wifi_is_suppressed()) {
+    wifi_apply_ps_mode(wifi_idle_ps_mode());
+  } else {
+    wifi_apply_ps_mode(WIFI_PS_NONE);
+  }
+#else
+  (void)enable;  // power save mode is static
 #endif
 }
