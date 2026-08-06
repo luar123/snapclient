@@ -1465,38 +1465,7 @@ static void http_get_task(void *pvParameters) {
 
     // Main connection loop - state machine + data processing
     while (1) {
-      bool restart = false;
       static bool playback_old = false;
-      if (xTaskNotifyWait(0, 0, &command, 1) == pdTRUE) {
-        switch(command) {
-          case STOP:
-            stop_player_task();  // stop player task for faster teardown
-            xSemaphoreTake(snapclientStateMux, portMAX_DELAY);
-            sc_state = STOPPED;
-            xSemaphoreGive(snapclientStateMux);
-            // fall through to restart connection and wait for START command
-          case RESTART:
-            restart = true;
-            break;
-          case UNPAUSE:
-            paused = false;
-            break;
-          case PAUSE:
-            paused = true;
-            break;
-          default:
-            break;
-        }
-      //ESP_LOGI(TAG, "http got cb. %s", paused ? "paused" : "playing/idle");
-      }
-      if (restart) {
-        //restart required
-        netconn_close(lwipNetconn);
-        netconn_delete(lwipNetconn);
-        lwipNetconn = NULL;
-        vTaskDelay(pdMS_TO_TICKS(2000)); // back-off before reconnecting
-        break; // restart connection
-      }
 
       if (playback_old != playback) {
         if (playback) {
@@ -1518,13 +1487,48 @@ static void http_get_task(void *pvParameters) {
       int result =
           process_data(&parser, &time_sync_data, &received_codec_header, &codec,
                        &scSet, &pcmData, &playback, paused);
-      if (result != 0) {
-        // Check if a RESTART arrived during the blocking recv
-        if (xTaskNotifyWait(0, 0, &command, 0) == pdTRUE &&
-            (command == RESTART || command == STOP)) {
-          vTaskDelay(pdMS_TO_TICKS(2000));
+
+      // Handle commands after process_data() so a notification arriving during
+      // the blocking recv is acted upon instead of only being drained.
+      bool restart = false;
+      bool stopped = false;
+      if (xTaskNotifyWait(0, 0, &command, 1) == pdTRUE) {
+        switch(command) {
+          case STOP:
+            stop_player_task();  // stop player task for faster teardown
+            xSemaphoreTake(snapclientStateMux, portMAX_DELAY);
+            sc_state = STOPPED;
+            xSemaphoreGive(snapclientStateMux);
+            stopped = true;  // close connection and wait for START command
+            break;
+          case RESTART:
+            restart = true;
+            break;
+          case UNPAUSE:
+            paused = false;
+            break;
+          case PAUSE:
+            paused = true;
+            break;
+          default:
+            break;
         }
-        break;
+      //ESP_LOGI(TAG, "http got cb. %s", paused ? "paused" : "playing/idle");
+      }
+
+      if (restart || stopped) {
+        netconn_close(lwipNetconn);
+        netconn_delete(lwipNetconn);
+        lwipNetconn = NULL;
+      }
+
+      // No back-off when stopping, the outer loop blocks on START anyway
+      if (!stopped && (restart || result != 0)) {
+        vTaskDelay(pdMS_TO_TICKS(2000)); // back-off before reconnecting
+      }
+
+      if (restart || stopped || result != 0) {
+        break; // restart connection
       }
     }
   }
