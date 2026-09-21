@@ -601,9 +601,17 @@ int start_player(snapcastSetting_t *setting) {
 
   ESP_LOGI(TAG, "Start player_task");
 
+#if CONFIG_FREERTOS_NUMBER_OF_CORES == 1
+  // Single-core targets (S2, C3/C6/H2, ...) only have core 0. Pinning to
+  // SYNC_TASK_CORE_ID (1) trips the xCoreID < configNUMBER_OF_CORES assert
+  // in FreeRTOS and boot-loops the chip, so let the scheduler place the task.
+  xTaskCreate(player_task, "player", 2048 + 512, NULL,
+              SYNC_TASK_PRIORITY, &playerTaskHandle);
+#else
   xTaskCreatePinnedToCore(player_task, "player", 2048 + 512, NULL,
                           SYNC_TASK_PRIORITY, &playerTaskHandle,
                           SYNC_TASK_CORE_ID);
+#endif
 
   call_state_cb();
   ESP_LOGI(TAG, "start player done");
