@@ -1250,8 +1250,16 @@ int init_snapcast(void (*set_volume)(int), void (*set_mute)(bool)) {
 }
 
 void start_snapcast() {
+#if CONFIG_FREERTOS_NUMBER_OF_CORES == 1
+  // Single-core targets (S2, C3/C6/H2, ...) only have core 0. Pinning to
+  // HTTP_TASK_CORE_ID (1) trips the xCoreID < configNUMBER_OF_CORES assert
+  // in FreeRTOS and boot-loops the chip, so let the scheduler place the task.
+  xTaskCreate(&http_get_task, "http", 15 * 1024, NULL,
+              HTTP_TASK_PRIORITY, &t_http_get_task);
+#else
   xTaskCreatePinnedToCore(&http_get_task, "http", 15 * 1024, NULL,
                           HTTP_TASK_PRIORITY, &t_http_get_task,
                           HTTP_TASK_CORE_ID);
+#endif
   ESP_LOGD(TAG, "Started snapcast client task");
 }
